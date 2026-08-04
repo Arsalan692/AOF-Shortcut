@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Source documents ARE tracked on purpose:
+#   Forms/Account_Opening_Form_blank template.pdf  - the field schema is derived
+#     from this file, so the pipeline cannot be rebuilt without it
+#   Forms/Cif-form.pdf                             - dummy-data sample form
+# Never add a blanket *.pdf rule here; it would silently exclude both.
+# ─────────────────────────────────────────────────────────────────────────────
+!Forms/
+!Forms/**
+
+# ── Generated pipeline artefacts ─────────────────────────────────────────────
+# Everything under build/ is derived and rebuilt by the pipeline:
+#   template_schema.json  <- python src/build_schema.py
+#   registered/ crops/ reads/ output/ qa/  <- per-document, regenerated per run
+#
+# build/uploads/ holds forms uploaded through the web UI. On a real form that is
+# customer PII, so this must never reach a repository.
+/build/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# ── Node / frontend ──────────────────────────────────────────────────────────
+# frontend/.gitignore already covers node_modules, dist and logs; this catches
+# the archived bundle, which its `dist` pattern does not match.
+frontend/dist.zip
+
+# ── Editors and OS clutter ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Scratch ──────────────────────────────────────────────────────────────────
+*.log
+*.tmp
