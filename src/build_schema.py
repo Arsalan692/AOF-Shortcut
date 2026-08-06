@@ -95,6 +95,7 @@ class Field:
     mirror: bool = False         # a right-hand Urdu-column duplicate of another field
     select_mode: str = ""        # checkbox only: "one" | "many" (from the form's own wording)
     row_y: float = 0.0
+    continuation_of: str = ""    # this box is the second line of that field's answer
 
 
 # ------------------------------------------------------------- vector harvest
@@ -612,6 +613,50 @@ def fill_continuations(fields: list[Field]) -> None:
             f.section = best.section
 
 
+CONT_MAX_DY = 14.0      # a wrapped line follows within one row gap
+CONT_MIN_INDENT = 5.0   # ...and starts left of its parent, at the page margin
+
+
+def link_continuations(fields: list[Field]) -> None:
+    """Link a text box that is really the second line of the box above it.
+
+    fill_continuations() covers the case where the wrapped line came out of labelling
+    with no label at all. It cannot cover this one: page 1's second Next-of-Kin address
+    line sits close enough to the printed word "Address" that the label probe claims it,
+    so that function's `if f.label: continue` skips it - and the form then reports two
+    separate fields both called "Address".
+
+    The discriminator against a stacked table row is the left edge. A wrapped line
+    begins at the page margin, left of its parent, because no printed label precedes it;
+    two rows of one table column share an x0 to the decimal. That distinction is what
+    keeps page 2's Amount (PKR) and No. of Transactions pairs, and page 9's two
+    Employee No. boxes, as the separate answers they really are.
+
+    Runs after assign_ids so it can point at a real id, and so relabelling here never
+    changes an id - ground truth is keyed by id.
+    """
+    for f in fields:
+        if f.kind != "text" or not f.label or f.mirror or f.table:
+            continue
+        fw = f.rect[2] - f.rect[0]
+        best, bestdy = None, 1e9
+        for g in fields:
+            if g is f or g.page != f.page or g.kind != "text" or g.label != f.label:
+                continue
+            gw = g.rect[2] - g.rect[0]
+            dy = f.rect[1] - g.rect[3]                      # f sits below g
+            if not (0 <= dy < CONT_MAX_DY) or dy >= bestdy:
+                continue
+            if min(fw, gw) / max(fw, gw) <= 0.7:
+                continue
+            if g.rect[0] - f.rect[0] < CONT_MIN_INDENT:     # not indented: a table row
+                continue
+            best, bestdy = g, dy
+        if best is not None:
+            f.continuation_of = best.id
+            f.label = f"{f.label} (cont.)"
+
+
 def slug(s: str, fallback: str) -> str:
     s = re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_").lower()
     return s or fallback
@@ -643,6 +688,7 @@ def main():
     fill_table_columns(all_fields)
     flag_urdu_mirrors(all_fields)
     assign_ids(all_fields)
+    link_continuations(all_fields)      # after ids: it stores one, and never changes one
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     payload = {

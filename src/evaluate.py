@@ -54,7 +54,25 @@ def main(doc: str, page: int):
     # ---------------------------------------------------------------- values
     # keyed by field id: labels are not unique (two page-1 fields are both "Address")
     got = {r["field"]: r for r in recs if r["kind"] != "checkbox"}
-    truth = gt["values"]
+    truth = dict(gt["values"])
+
+    # A wrapped answer is read as one strip, so its whole text lands in the parent box
+    # while the continuation box is legitimately empty. Ground truth was transcribed
+    # box-by-box, so compare the joined value against the joined truth - otherwise both
+    # halves score as misses purely because of where the line break was recorded.
+    folded = []
+    for r in recs:
+        parent = r.get("continuation_of")
+        if not parent or parent not in truth or r["field"] not in truth:
+            continue
+        if str((got.get(parent) or {}).get("value") or "") == "":
+            continue                      # parent empty: nothing was folded, score as-is
+        truth[parent] = ", ".join(p.strip().rstrip(",").strip()
+                                  for p in (truth[parent], truth[r["field"]]) if p.strip())
+        truth.pop(r["field"])
+        folded.append(r["label"])
+    if folded:
+        print(f"  wrapped answers scored as one value: {', '.join(folded)}")
     exact = nrm = 0
     empty_right = empty_total = 0
     rows = []

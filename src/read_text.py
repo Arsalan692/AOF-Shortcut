@@ -31,7 +31,7 @@ import urllib.request
 import cv2
 import numpy as np
 
-from validate import assess, infer_type
+from validate import NUMERIC, assess, infer_type
 
 # field labels carry non-ASCII typography; never let printing them kill a long run
 if hasattr(sys.stdout, "reconfigure"):
@@ -39,7 +39,23 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")
+
+# Two readers, each given the fields its architecture suits. Measured on page 1:
+#
+#                    structured (16)   words (28)
+#   qwen2.5vl:7b       14 (87%)         27 (96%)
+#   glm-ocr (1.1B)     16 (100%)        22 (79%)
+#
+# A general VLM reads cursive well because it knows the language - shown a blurry scrawl
+# it recovers "Fountain". That same prior is what makes it invent a digit: a CNIC has no
+# vocabulary to fall back on, so "35810" came back as "35820" - well-formed, and therefore
+# undetectable by any format check. An OCR model has no such prior and simply copies the
+# characters, which is why the 1.1B model beats the 8.3B one on every structured field.
+# Prompting cannot close this gap: the shape of each value is already in the prompt (see
+# describe()), and pushing harder on wording plus double row height scored 12/16 and began
+# attaching values to the wrong strip.
+MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")            # names, addresses, free text
+MODEL_NUM = os.environ.get("HBL_VLM_NUM", "glm-ocr:latest")  # dates, CNIC, phone, amounts
 
 BATCH = 10            # fields per first-pass image. 10 keeps the montage near 1 Mpx,
                       # which is inside the model's pixel budget - past that the input
@@ -87,10 +103,15 @@ def describe(field: dict) -> str:
     return f"{cells} character boxes" if cells else "free text"
 
 
-def build_prompt(items: list[dict]) -> str:
-    lines = "\n".join(
-        f'{i}. "{it["label"]}" - expect {describe(it)}'
-        for i, it in enumerate(items, 1))
+def build_prompt(items: list[dict], conts: dict | None = None) -> str:
+    conts = conts or {}
+
+    def line(i, it):
+        n = len(conts.get(it["field"], ()))
+        wrapped = (f", written across {n + 1} lines - read them as one value" if n else "")
+        return f'{i}. "{it["label"]}" - expect {describe(it)}{wrapped}'
+
+    lines = "\n".join(line(i, it) for i, it in enumerate(items, 1))
     return f"""This image contains {len(items)} separate fields cropped from one scanned bank form.
 They are stacked vertically, separated by black lines, and numbered on the left.
 
@@ -133,12 +154,46 @@ def strip(path: str, row_h: int = ROW_H, max_w: int = MAX_W) -> np.ndarray | Non
     return im
 
 
-def montage(items: list[dict], row_h: int = ROW_H, max_w: int = MAX_W) -> np.ndarray:
+def field_strip(it: dict, row_h: int, max_w: int, extra=()) -> np.ndarray | None:
+    """The image for one field: its own crop, with any continuation lines stacked beneath.
+
+    A wrapped answer is deliberately shown as one strip. Read separately, the first line of
+    the Next-of-Kin address came back as "Block B"; read with its second line visible, the
+    same pixels came back "Block 6" - with "Gulshan-e-Iqbal" following it, a block *number*
+    is the reading that fits. Presenting them joined is how the model gets that context on
+    purpose, instead of us hoping it merges two adjacent strips by itself, which it
+    sometimes does and which silently empties the second box when it happens.
+
+    The lines are separated by white, not by the montage's black rule: within a field they
+    are one wrapped answer, and the black rule means "different field".
+    """
+    ims = []
+    for part in (it, *extra):
+        im = strip(os.path.join(ROOT, part["crop"]), row_h, max_w)
+        if im is not None:
+            ims.append(im)
+    if not ims:
+        return None
+    if len(ims) == 1:
+        return ims[0]
+    w = max(i.shape[1] for i in ims)
+    rows: list[np.ndarray] = []
+    for i in ims:
+        if i.shape[1] < w:
+            i = np.hstack([i, np.full((i.shape[0], w - i.shape[1]), 255, np.uint8)])
+        rows.append(i)
+        rows.append(np.full((2, w), 255, np.uint8))      # a line gap, not a field divider
+    return np.vstack(rows[:-1])
+
+
+def montage(items: list[dict], row_h: int = ROW_H, max_w: int = MAX_W,
+            conts: dict | None = None) -> np.ndarray:
     """Numbered strips stacked into one image. Rows may differ in height - the number
     in the gutter is what ties a value to its field, not the row geometry."""
+    conts = conts or {}
     tiles = []
     for n, it in enumerate(items, 1):
-        im = strip(os.path.join(ROOT, it["crop"]), row_h, max_w)
+        im = field_strip(it, row_h, max_w, conts.get(it["field"], ()))
         if im is None:
             im = np.full((24, 40), 255, np.uint8)
         h = im.shape[0]
@@ -178,8 +233,27 @@ def keys_schema(n: int) -> dict:
             "required": keys}
 
 
-def generate(prompt: str, img_b64: str, fmt, num_predict: int) -> str:
-    body = {"model": MODEL, "prompt": prompt, "images": [img_b64], "stream": False,
+def reader_for(field: dict) -> str:
+    """Which model reads this field. The template already told us every field's type at
+    schema time, so the routing costs nothing to work out."""
+    return MODEL_NUM if infer_type(field) in NUMERIC else MODEL
+
+
+def first_line(v: str) -> str:
+    """glm-ocr answers correctly and then keeps talking - '1023\\n```markdown\\n1023'.
+    The first non-empty line is the value. Scoped to the OCR reader: qwen returns clean
+    strings, and a blanket first-line rule would silently truncate anything multi-line.
+    """
+    for ln in str(v).splitlines():
+        ln = ln.strip().strip("`").strip()
+        if ln:
+            return ln
+    return ""
+
+
+def generate(prompt: str, img_b64: str, fmt, num_predict: int, model: str = "") -> str:
+    body = {"model": model or MODEL, "prompt": prompt, "images": [img_b64],
+            "stream": False, "keep_alive": "1h",     # never reload 6GB between batches
             "options": {"temperature": 0, "num_predict": num_predict}}
     if fmt:
         body["format"] = fmt
@@ -190,10 +264,12 @@ def generate(prompt: str, img_b64: str, fmt, num_predict: int) -> str:
         return json.loads(r.read()).get("response", "")
 
 
-def read_batch(items: list[dict], row_h: int = ROW_H,
-               max_w: int = MAX_W) -> dict[str, str]:
-    raw = generate(build_prompt(items), png_b64(montage(items, row_h, max_w)),
-                   keys_schema(len(items)), 80 + 40 * len(items))
+def read_batch(items: list[dict], row_h: int = ROW_H, max_w: int = MAX_W,
+               model: str = "", conts: dict | None = None) -> dict[str, str]:
+    model = model or MODEL
+    raw = generate(build_prompt(items, conts),
+                   png_b64(montage(items, row_h, max_w, conts)),
+                   keys_schema(len(items)), 80 + 40 * len(items), model)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -204,7 +280,7 @@ def read_batch(items: list[dict], row_h: int = ROW_H,
     for i, it in enumerate(items, 1):
         v = data.get(str(i), data.get(i))
         if isinstance(v, (str, int, float)):
-            out[it["field"]] = str(v)
+            out[it["field"]] = first_line(v) if model == MODEL_NUM else str(v)
     return out
 
 
@@ -223,6 +299,49 @@ def read_single(item: dict) -> str:
 
 
 # ----------------------------------------------------------------------- main
+def _clashes(it: dict, batch: list[dict]) -> bool:
+    """True if `it` and something already in `batch` are two lines of one answer."""
+    cont = it.get("continuation_of", "")
+    if cont and any(b["field"] == cont for b in batch):
+        return True
+    return any(b.get("continuation_of", "") == it["field"] for b in batch)
+
+
+def split_batches(items: list[dict], size: int) -> list[list[dict]]:
+    """Batches of <= size that never hold a field and its own continuation.
+
+    Normally moot: run() folds a continuation into its parent's strip, so it is not a
+    batch item at all. This stays as the guard for a continuation that reaches the queue
+    anyway - a crop index built before `continuation_of` existed, say. Both in one montage
+    is the case to avoid: two adjacent strips of visually continuous handwriting get read
+    as a single value, which returns the whole answer in the first box and empties the
+    second. Continuations go to the front so the pair separates without stranding an
+    under-filled image, which costs as much to run as a full one.
+    """
+    items = ([it for it in items if it.get("continuation_of")]
+             + [it for it in items if not it.get("continuation_of")])
+    out: list[list[dict]] = []
+    cur: list[dict] = []
+    for it in items:
+        if cur and (len(cur) >= size or _clashes(it, cur)):
+            out.append(cur)
+            cur = []
+        cur.append(it)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def available_models() -> set[str]:
+    """What Ollama actually has pulled. Returns an empty set if it cannot be asked, which
+    the caller reads as "assume it is there" - a health probe must not abort a real run."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=15) as r:
+            return {m["name"] for m in json.loads(r.read()).get("models", [])}
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return set()
+
+
 def load_cache(path: str) -> dict:
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
@@ -247,25 +366,50 @@ def run(doc: str, pages=None, batch=BATCH, retry=True, force=False, limit=None,
     cache_path = os.path.join(ROOT, "build", "reads", f"{doc}.json")
     cache = {} if force else load_cache(cache_path)
 
+    # A wrapped answer is read as one strip, so a continuation never gets a call of its
+    # own: it is shown beneath its parent and its text arrives inside the parent's value.
+    conts: dict[str, list] = {}
+    for r in index:
+        parent = r.get("continuation_of")
+        if parent and (pages is None or r["page"] in pages):
+            conts.setdefault(parent, []).append(r)
+
     todo = [r for r in index
             if r["needs_model"] and (pages is None or r["page"] in pages)
-            and r["field"] not in cache]
+            and r["field"] not in cache and not r.get("continuation_of")]
     # zero-ink fields are settled without spending a call on them
     for r in index:
         if not r["needs_model"] and r["field"] not in cache:
             cache[r["field"]] = {"value": "", "source": "ink-gate", "seconds": 0.0}
 
-    batches = [todo[i:i + batch] for i in range(0, len(todo), batch)]
+    # A montage may only hold one reader's fields, so the two groups are batched apart.
+    # This is also why routing shifts the text values slightly: taking the numeric fields
+    # out changes which text fields share an image, and the montage is a shared canvas.
+    avail = available_models()
+    numeric_reader = MODEL_NUM if (not avail or MODEL_NUM in avail) else MODEL
+    if numeric_reader != MODEL_NUM:
+        print(f"WARNING: {MODEL_NUM} is not installed - reading numeric fields with "
+              f"{MODEL} instead (expect digit slips it cannot detect)")
+
+    groups: dict[str, list] = {}
+    for r in todo:
+        m = numeric_reader if reader_for(r) == MODEL_NUM else MODEL
+        groups.setdefault(m, []).append(r)
+
+    batches = [(m, chunk) for m, g in groups.items()
+               for chunk in split_batches(g, batch)]
     if limit:
         batches = batches[:limit]
-    print(f"{len(todo)} fields to read in {len(batches)} batches of <= {batch} "
-          f"({MODEL} at {OLLAMA})")
+    print(f"{len(todo)} fields to read in {len(batches)} batches of <= {batch} at {OLLAMA}")
+    for m, g in groups.items():
+        print(f"  {m:<18} {len(g)} fields "
+              f"({'digits' if m == numeric_reader and m != MODEL else 'words'})")
 
     t0 = time.time()
-    for bi, items in enumerate(batches, 1):
+    for bi, (model, items) in enumerate(batches, 1):
         t = time.time()
         try:
-            got = read_batch(items)
+            got = read_batch(items, model=model, conts=conts)
         except (urllib.error.URLError, OSError, RuntimeError) as e:
             print(f"  batch {bi}/{len(batches)} FAILED: {e}")
             got = {}
@@ -273,7 +417,15 @@ def run(doc: str, pages=None, batch=BATCH, retry=True, force=False, limit=None,
         for it in items:
             if it["field"] in got:
                 cache[it["field"]] = {"value": got[it["field"]], "source": "batch",
+                                      "model": model,
                                       "seconds": round(dt / len(items), 2)}
+                # its continuation lines were part of that same strip, so they are
+                # settled too - recorded explicitly so nothing downstream reads them
+                # as a filled box that came back empty
+                for c in conts.get(it["field"], ()):
+                    cache[c["field"]] = {"value": "", "source": "with-parent",
+                                         "parent": it["field"], "model": model,
+                                         "seconds": 0.0}
         miss = [it for it in items if it["field"] not in got]
         print(f"  batch {bi}/{len(batches)}: {len(items) - len(miss)}/{len(items)} "
               f"in {dt:.0f}s ({dt/max(len(items),1):.1f}s/field)"
@@ -292,25 +444,36 @@ def run(doc: str, pages=None, batch=BATCH, retry=True, force=False, limit=None,
             if pages is not None and r["page"] not in pages:
                 continue
             c = cache.get(r["field"])
-            if not r["needs_model"]:
-                continue
+            if not r["needs_model"] or r.get("continuation_of"):
+                continue        # a continuation has no reading of its own to re-check
             if c is None:
                 bad.append((r, "no value"))
             elif c["source"] == "batch":
                 a = assess(c["value"], r)
                 if not a["valid"]:
                     bad.append((r, a["note"]))
-        groups = [bad[i:i + RETRY_BATCH] for i in range(0, len(bad), RETRY_BATCH)]
+        # grouped by reader as well as by size: a re-read goes back to the model that
+        # owns the field, so a field never changes hands between passes
+        per_model: dict[str, list] = {}
+        for r, why in bad:
+            m = numeric_reader if reader_for(r) == MODEL_NUM else MODEL
+            per_model.setdefault(m, []).append((r, why))
+        groups = []
+        for m, g in per_model.items():
+            why_of = {r["field"]: w for r, w in g}
+            for chunk in split_batches([r for r, _ in g], RETRY_BATCH):
+                groups.append((m, [(r, why_of[r["field"]]) for r in chunk]))
         if bad:
             print(f"\nre-reading {len(bad)} field(s) in {len(groups)} batch(es) "
                   f"at {RETRY_ROW_H}px per field:")
-        for gi, grp in enumerate(groups, 1):
+        for gi, (model, grp) in enumerate(groups, 1):
             if progress:
                 progress(len(todo), len(todo),
                          f"Re-checking uncertain fields ({gi} of {len(groups)})")
             t = time.time()
             try:
-                got = read_batch([r for r, _ in grp], RETRY_ROW_H, RETRY_MAX_W)
+                got = read_batch([r for r, _ in grp], RETRY_ROW_H, RETRY_MAX_W,
+                                 model, conts)
             except (urllib.error.URLError, OSError, RuntimeError) as e:
                 print(f"  re-read batch {gi}/{len(groups)} FAILED: {e}")
                 continue
@@ -328,7 +491,8 @@ def run(doc: str, pages=None, batch=BATCH, retry=True, force=False, limit=None,
                 print(f"  {r['label'][:34]:<36} ({why}) -> {v!r} "
                       f"{'accepted' if keep else 'rejected, keeping first-pass value'}")
                 if keep:
-                    cache[r["field"]] = {"value": v, "source": "retry", "seconds": per}
+                    cache[r["field"]] = {"value": v, "source": "retry",
+                                         "model": model, "seconds": per}
             print(f"  re-read batch {gi}/{len(groups)}: {dt:.0f}s ({per:.1f}s/field)")
             sys.stdout.flush()          # long runs are usually watched from a log file
             save_cache(cache_path, cache)

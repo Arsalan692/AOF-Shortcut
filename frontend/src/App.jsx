@@ -31,12 +31,15 @@ function ConfPill({ conf }) {
 function FieldRow({ jobId, rec }) {
   const [open, setOpen] = useState(false)
   const showable = rec.kind !== 'checkbox'
+  // a wrapped second line: one answer written across two boxes on the page, so it is
+  // shown tucked under its first line rather than as another field of the same name
+  const cont = Boolean(rec.continuation_of)
   const val = rec.kind === 'checkbox'
     ? (rec.value ? 'Ticked' : '—')
     : rec.value
 
   return (
-    <div className={`frow ${rec.needs_review ? 'flagged' : ''} ${open ? 'open' : ''}`}>
+    <div className={`frow ${cont ? 'cont' : ''} ${rec.needs_review ? 'flagged' : ''} ${open ? 'open' : ''}`}>
       <button
         className="frow-main"
         onClick={() => showable && setOpen((o) => !o)}
@@ -44,7 +47,8 @@ function FieldRow({ jobId, rec }) {
         disabled={!showable}
       >
         <span className="frow-label">
-          {rec.label}
+          {cont && <span className="frow-cont" aria-hidden="true">↳</span>}
+          {cont ? 'continued' : rec.label}
           {rec.group && rec.kind === 'checkbox' && <span className="frow-group">{rec.group}</span>}
         </span>
         <span className="frow-value">

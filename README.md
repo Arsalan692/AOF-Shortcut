@@ -34,7 +34,7 @@ and every field is read from a known rectangle.
 | 2. align each scan page to the template, isolate pen ink | `src/register.py` | `build/registered/<doc>/{reg,ink}_p*.png`, `alignment.json` |
 | 3. read tick boxes by measuring ink | `src/read_checkboxes.py` | in-memory (used by step 6) |
 | 4. cut one image per field | `src/crop_fields.py` | `build/crops/<doc>/`, `index.json` |
-| 5. transcribe handwriting with the local VLM | `src/read_text.py` | `build/reads/<doc>.json` |
+| 5. transcribe handwriting locally — digits by OCR model, words by VLM | `src/read_text.py` | `build/reads/<doc>.json` |
 | 6. validate, cross-check and assemble | `src/extract.py` | `build/output/<doc>.{json,csv}` |
 
 Supporting tools: `src/validate.py` (types, format checks, repairs), `src/qa_schema.py`
@@ -89,9 +89,12 @@ Working on the frontend? Run `npm run dev` in `frontend/` as well and use
 > Run uvicorn from `backend/`, or pass `--app-dir backend` from the project root.
 > `app:app` has to be importable, and it imports `jobs` from the same folder.
 
-Ollama must be running with `qwen2.5vl:7b` pulled. `GET /api/health` reports whether the
-model and schema are ready, and the UI shows a banner if the model is unreachable.
-Override with the `HBL_VLM` and `OLLAMA_HOST` environment variables.
+Ollama must be running with **both** `qwen2.5vl:7b` and `glm-ocr` pulled — the first reads
+words, the second reads digits (see *Two readers* below). If `glm-ocr` is missing the run
+still completes: numeric fields fall back to the VLM with a printed warning, at the cost of
+digit errors it cannot detect. `GET /api/health` reports whether the model and schema are
+ready, and the UI shows a banner if the model is unreachable. Override with `HBL_VLM`,
+`HBL_VLM_NUM` and `OLLAMA_HOST`.
 
 ## Run the pipeline from the command line
 
@@ -125,12 +128,44 @@ holds ≥55% of the group's total. If any option was struck through its interior
 decide and the halo measurements are discarded — otherwise the halos of *losing* options
 pick up bleed from nearby handwriting and out-vote a clear winner.
 
+**A wrapped line is one answer, not two.** The Next of Kin address is two white boxes,
+one per line, and the label probe finds the printed word "Address" for both — so the form
+reported two fields of the same name. A second line is told apart from a stacked table row
+by its **left edge**: a wrapped line starts at the page margin, left of its parent, because
+no printed label precedes it, whereas two rows of one table column share an x0 exactly.
+That distinction keeps page 2's `Amount (PKR)` and `No. of Transactions` pairs and page 9's
+two `Employee No.` boxes as the separate answers they really are — getting it wrong in that
+direction would silently move one field's value into another, and both would still look
+valid. Records stay one-per-box so each line keeps its own reviewable crop; the reader shows
+the lines joined (see *A wrapped answer* below) and the `answers` view rejoins the values.
+
 **Blank detection is deliberately conservative.** Because writing overflows, a box can
 contain real ink belonging to its neighbour (on page 3 the ID Number digits spill into the
 CIF Number cells), so "has ink" and "is filled" are different questions. Against ground
 truth no pixel statistic separates them — stroke thickness overlaps (filled min 2.87 vs
 empty max 3.82), as does eroded area (41 vs 251). Only zero-ink fields skip the model; the
 rest are read and may come back `EMPTY`.
+
+**But a trace of ink is not evidence of an answer.** "Ink here, nothing transcribed" is
+worth reviewing only above a floor (`INK_FLOOR_PX`): page 1's three genuinely-empty
+*Other (specify)* boxes hold 186, 328 and 373px of a neighbour's overflow, while the
+smallest real answer on the page — the single digit in *Number of Dependents* — holds 827.
+This suppresses the flag only; the field is still cropped and still read.
+
+Date grids stay unreliable here and are left flagged: the printed `D D M M Y Y Y Y`
+placeholders leave a residue the ink layer cannot fully subtract, and subtracting the
+template's own ink (`baseline_px`) does not separate them — empty *HBL Customer Since*
+carries 1342px above its baseline, filled *CIF Opening Date* carries 1358.
+
+**A traced rule is not part of the value.** A reader that follows the printed line into its
+answer returns `-Karachi`. Removing a *leading* dash or underscore is exempt from the
+invalid→valid repair rule below, because it removes the box rather than correcting the
+writer. Leading side only: `Shabn.` and `H. No.` end in a full stop the writer made.
+
+**Address lines are not names.** The form labels them `House/Appt. No./Appt. Name`,
+`Street No./Name` and `Office No./Office Name`, so a rule matching *name* claims them and
+then rejects `H. No. 43/2` for containing digits and a slash. Address vocabulary is matched
+first — but after `email`, since `Email Address` contains "address".
 
 **A bad page must fail loudly.** A misregistered page does not produce slightly wrong
 data, it reads ink from the wrong boxes. Every page is gated on coverage (≥0.80 of
@@ -153,15 +188,71 @@ stacked into one numbered montage costs ~19s/field — about an hour for a full 
 The JSON **schema** on the Ollama request is required, not cosmetic: with a bare
 `format: "json"` the model emitted two keys and stopped.
 
+Measured again later, the per-image cost is what dominates: five page-1 montages cost
+224/186/189/186/180s, and the 5-strip half-empty one cost the same as the full ones — the
+noise between two identical requests (186 vs 224s) exceeds the difference between a full
+image and a half-empty one. Packing more strips per image by trimming the 60% of each
+montage that is white padding did cut 5 images to 3, but corrupted 3 of 26 fields and
+manufactured exactly the format-valid single-character errors that are hardest to detect.
+Not worth it; the montage is left alone.
+
+**Two readers, routed by field type.** A general VLM reads cursive well *because* it knows
+the language — shown a blurry scrawl it recovers "Fountain". That same prior is what makes
+it invent a digit: a CNIC has no vocabulary to fall back on, so `35810` came back as
+`35820`, well-formed and therefore invisible to every format check. An OCR model has no
+such prior and simply copies characters. Measured on page 1:
+
+| | structured (16) | words (28) |
+|---|---|---|
+| `qwen2.5vl:7b` (8.3B) | 14 (87%) | **27 (96%)** |
+| `glm-ocr` (1.1B) | **16 (100%)** | 22 (79%) |
+
+So numeric fields go to the OCR model and words to the VLM — 43/46 → 44/46, and 18.2 min
+→ 11.2, because the small model is 2.3x faster on the fields it owns. The routing is free:
+the template established every field's type at schema time.
+
+Prompting cannot substitute for this. The expected shape of every value is already in the
+prompt (`describe()`), and pushing harder — numeric-only batches, a prompt forbidding
+"plausible" answers, double row height — scored **12/16** and began attaching values to the
+wrong strip. The failure was never classification; the model knew it was reading a CNIC.
+It could not see the digit.
+
+**A montage is a shared canvas, so reads are not independent.** Changing which fields share
+an image changes answers for fields whose own pixels did not move: routing the numeric
+fields away re-rolled the text reads, costing `Father's Name` in one run, `Mother's Maiden
+Name` in another, and nothing in a third. Nothing about a strip's own resolution changed in
+any of them. This is the main reason a score moves by a field or two between runs, and it is
+the cost of batching — which is not optional on CPU.
+
+**A wrapped answer is read as one strip, on purpose.** Left as two adjacent strips, the two
+Next-of-Kin address lines were read as a single value: the whole address came back in the
+first box and the second came back empty, which then flagged a box holding 19,092px of ink
+as "ink present but read as empty". The crops were not at fault — they do not overlap by a
+single point — the two lines simply look like one line of handwriting.
+
+Splitting the pair across separate images fixed the empty box but cost accuracy: line 1
+alone reads `Block B`, whereas with `Gulshan-e-Iqbal` visible after it the same pixels read
+`Block 6` — following a street name, a block *number* is what fits. So the context is worth
+having, and `field_strip()` supplies it deliberately: a continuation is stacked beneath its
+parent, separated by white rather than the montage's black rule, and the prompt says
+"written across 2 lines - read them as one value". The continuation is then not a batch item
+at all, so it costs no extra call and no extra image, and it is recorded as
+`read-with-parent` rather than as a filled box that came back empty.
+
+Ground truth was transcribed box-by-box, so `evaluate.py` joins a parent and its
+continuation before scoring; otherwise both halves would count as misses purely because of
+where the line break happened to be recorded.
+
 ---
 
 ## Output
 
 `build/output/<doc>.json` carries one record per field with `value`, `raw`, `type`,
-`source` (`checkbox-cv` / `vlm-batch` / `vlm-single` / `ink-gate`), `confidence`,
-`valid`, `note` and `needs_review`, plus an `answers` view grouped by form section, the
-per-page alignment verdicts, and any cross-field contradictions. `<doc>.csv` is the same
-records flattened for review in Excel.
+`source` (`checkbox-cv` / `vlm-batch` / `vlm-recheck` / `read-with-parent` / `ink-gate`),
+`model` (which reader produced it), `confidence`, `valid`, `note` and `needs_review`,
+plus an `answers` view
+grouped by form section, the per-page alignment verdicts, and any cross-field
+contradictions. `<doc>.csv` is the same records flattened for review in Excel.
 
 Nothing is silently dropped or silently corrected. Repairs are one-directional — a
 letter/digit substitution is accepted only when it turns an invalid value into a valid

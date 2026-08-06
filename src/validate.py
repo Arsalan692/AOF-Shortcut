@@ -32,6 +32,13 @@ LABEL_TYPES: list[tuple[str, str]] = [
     (r"branch code|customer number|p\.?a\.?\s*no|personnel id|\bcode\b|\bp\.?\s*no\b",
      "digits"),
     (r"a/?c no|account no|card no", "account"),
+    # An address line legitimately holds digits and slashes - "H. No. 43/2" - so it must
+    # be caught before the `name` rule below, which the form's own labels would otherwise
+    # apply to "House/Appt. No./Appt. Name", "Street No./Name" and "Office No./Office
+    # Name" and then reject every real value they hold. This sits after `email` on purpose:
+    # "Email Address" contains "address" and has already been typed by then.
+    (r"house|appt|apartment|\bflat\b|\bplot\b|street|\broad\b|address|building|"
+     r"\bfloor\b|\bblock\b|sector|village|mohallah?|landmark|\btown\b|office no", "text"),
     (r"name", "name"),
 ]
 
@@ -62,6 +69,11 @@ def infer_type(field: dict) -> str:
 # The rest are things a customer actually writes to mean "does not apply" - both end up
 # as a null value, but only the latter is evidence that the field really was filled in.
 SENTINELS = {"", "empty"}
+# A reader that traces the printed rule into its answer hands back "-Karachi" or
+# "_Pakistan". The dash is the box, not a character the writer put there, so removing it
+# is not a correction of content and is exempt from the invalid->valid rule below.
+# Leading side only, and never the full stop: "Shabn." and "H. No." end in a real one.
+LEAD_ARTEFACT = " _*|=–—-"
 NONE_MARKERS = {"none", "n/a", "na", "-", "--", "nil", "null", "no"}
 EMPTY_TOKENS = SENTINELS | NONE_MARKERS
 
@@ -166,10 +178,13 @@ def assess(value: str | None, field: dict) -> dict:
                 "explicit_none": explicit, "raw": raw,
                 "note": f"written as {core!r}" if explicit else ""}
 
-    ok, norm, msg = check(raw, ftype)
+    # after the empty test, so a lone "-" still counts as the writer's "does not apply".
+    # raw itself is left alone: it is what the model said, and the record reports it.
+    body = raw.lstrip(LEAD_ARTEFACT)
+    ok, norm, msg = check(body, ftype)
     note = ""
     if not ok:
-        norm2, note = repair(raw, ftype)
+        norm2, note = repair(body, ftype)
         if note:
             ok, norm, msg = True, norm2, ""
     return {"type": ftype, "value": norm, "valid": ok, "empty": False,

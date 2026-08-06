@@ -290,6 +290,9 @@ def run(doc: str, upscale: int = UPSCALE) -> list[dict]:
                 "field": f["id"], "page": pno, "kind": f["kind"],
                 "label": f["label"], "section": f["section"],
                 "table": f["table"], "grid_hint": f["grid_hint"],
+                # carried through so the reader can keep a wrapped line out of the same
+                # montage as the line it continues - see split_batches() in read_text.py
+                "continuation_of": f.get("continuation_of", ""),
                 "cells": len(f["cells"]), "crop": os.path.relpath(path, ROOT),
                 "rect": [round(v, 2) for v in f["rect"]],
                 "crop_rect": [round(v, 2) for v in ext],

@@ -35,7 +35,17 @@ SCHEMA = os.path.join(ROOT, "build", "template_schema.json")
 
 SOURCE_NAMES = {"batch": "vlm-batch", "retry": "vlm-recheck",
                 "single": "vlm-single",      # kept for caches written before batched re-reads
+                "with-parent": "read-with-parent",   # a wrapped line, read as one strip
                 "ink-gate": "ink-gate"}
+
+# Below this, "there is ink here" is not evidence that this box was filled in. Because
+# handwriting overflows its box by design (see README), an empty field next to a full one
+# picks up a few hundred pixels of its neighbour's strokes. Measured on page 1: the three
+# genuinely-empty "Other (specify)" boxes carry 186, 328 and 373px, while the smallest
+# real answer on the page - a single digit, "4" in Number of Dependents - carries 827.
+# The floor sits between them with room on both sides. It only suppresses the review
+# flag; the field is still cropped and still read, so a value here is never discarded.
+INK_FLOOR_PX = 500
 
 
 def load(doc: str):
@@ -88,13 +98,21 @@ def build(doc: str) -> dict:
                 conf = "low"
             elif src == "ink-gate":
                 conf = "high"                  # zero ink: empty is a measurement
+            elif src == "read-with-parent":
+                # this box holds the second line of the box above it, and both were read
+                # from one strip. Its text is in the parent's value, so an empty value
+                # here is correct and the ink in it is already accounted for.
+                conf = "high"
+                note = note or "read together with the line above"
             elif c["ink_hint"] == "faint" and not a["empty"]:
                 # the pixels say barely-anything, the model says there is a value
                 conf = "low"
                 note = note or "faint ink but a value was read - check for spill-over"
-            elif c["ink_hint"] != "empty" and a["empty"] and not a.get("explicit_none"):
+            elif (c["ink_hint"] != "empty" and c["ink_px"] >= INK_FLOOR_PX
+                    and a["empty"] and not a.get("explicit_none")):
                 # ink was measured but nothing was transcribed - either a missed value
-                # or spill-over from a neighbour. An explicit "N/A" is not this case.
+                # or spill-over from a neighbour. An explicit "N/A" is not this case,
+                # and neither is a trace too small to be an answer (INK_FLOOR_PX).
                 conf = "low"
                 note = note or "ink present but read as empty"
 
@@ -105,6 +123,10 @@ def build(doc: str) -> dict:
                 "source": src, "confidence": conf,
                 "valid": a["valid"], "note": note,
                 "ink_hint": c["ink_hint"], "ink_px": c["ink_px"],
+                "continuation_of": f.get("continuation_of", ""),
+                # which reader produced this: numeric fields go to an OCR model, words to
+                # a general VLM, so the value's provenance is part of the record
+                "model": (r or {}).get("model", ""),
             }
 
         rec["page_problems"] = page_problems
@@ -120,14 +142,30 @@ def build(doc: str) -> dict:
 
 # ------------------------------------------------------------------ rendering
 def answers_view(records) -> dict:
-    """A human-shaped summary: one entry per question, grouped by section."""
+    """A human-shaped summary: one entry per question, grouped by section.
+
+    A wrapped second line is one answer split across two boxes on the page, so it is
+    rejoined here rather than reported as its own field. The per-field records stay
+    one-per-box, because each line still has its own crop to review.
+    """
     out: dict = defaultdict(dict)
     groups: dict = defaultdict(list)
+    conts: dict = defaultdict(list)
+    for r in records:
+        if r.get("continuation_of"):
+            conts[r["continuation_of"]].append(r)
+
     for r in records:
         if r["kind"] == "checkbox":
             groups[(r["section"], r["group"] or r["label"])].append(r)
-        elif r["value"] not in (None, ""):
-            out[r["section"] or "(unsectioned)"][r["label"]] = r["value"]
+            continue
+        if r.get("continuation_of"):
+            continue                                  # folded into its parent below
+        parts = [r["value"]] + [c["value"] for c in conts.get(r["field"], [])]
+        # a line often ends with the comma that leads into the next one
+        parts = [str(p).strip().rstrip(",").strip() for p in parts if p not in (None, "")]
+        if parts:
+            out[r["section"] or "(unsectioned)"][r["label"]] = ", ".join(parts)
     for (section, q), members in groups.items():
         sel = [m["label"] for m in members if m["value"]]
         if sel:
@@ -146,7 +184,7 @@ def write_outputs(doc: str, data: dict) -> tuple[str, str]:
 
     cpath = os.path.join(outdir, f"{doc}.csv")
     cols = ["page", "section", "group", "label", "kind", "type", "value", "raw",
-            "source", "confidence", "valid", "needs_review", "note", "field"]
+            "source", "model", "confidence", "valid", "needs_review", "note", "field"]
     with open(cpath, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
