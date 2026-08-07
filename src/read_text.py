@@ -23,6 +23,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -31,7 +32,7 @@ import urllib.request
 import cv2
 import numpy as np
 
-from validate import NUMERIC, assess, infer_type
+from validate import OCR_TYPES, assess, infer_type
 
 # field labels carry non-ASCII typography; never let printing them kill a long run
 if hasattr(sys.stdout, "reconfigure"):
@@ -77,33 +78,79 @@ TIMEOUT = 3600
 
 
 # ------------------------------------------------------------------ prompting
+ADDRESSY = re.compile(r"house|appt|apartment|flat|plot|street|road|address|building|"
+                      r"floor|block|sector|village|mohallah?|landmark|town|office no")
+# Place names are where a general VLM does its worst damage, because its prior pulls an
+# unfamiliar Pakistani name toward a familiar English word - "Jhang" came back as "Thang".
+PLACEY = re.compile(r"\bcity\b|district|\bcountry\b|province|\bplace\b|nationalit|"
+                    r"landmark|\barea\b|\btown\b|birth")
+
+
 def describe(field: dict) -> str:
-    """A short expectation for the prompt. Telling the model the shape of the answer
-    measurably reduces digit slips on the structured fields."""
+    """A short expectation for the prompt, using the real Pakistani format for the field.
+
+    These are the formats as issued in Pakistan, not patterns copied off a sample form.
+    Stating the exact digit count is what stops a reader inventing or dropping one: told
+    only "a phone number", a reader will happily return ten digits or twelve.
+    """
     t = infer_type(field)
+    label = (field.get("label") or "").lower()
     cells = field.get("cells") or 0
     hint = (field.get("grid_hint") or "").upper()
     if t == "date":
         order = hint if hint else "DDMMYYYY"
-        return f"a date written as {len(order)} digits in {order} order"
+        return (f"a date as {len(order)} digits in {order} order "
+                "(day 01-31, month 01-12, 4-digit year)")
+    # The template's own grid encodes the real format including its separators: a CNIC box
+    # is 15 cells for 13 digits and 2 dashes, a mobile 12 for 11 digits and 1 dash. Giving
+    # the reader the cell count as well as the rule lets it count boxes against the answer.
+    boxes = f", across {cells} character boxes" if cells else ""
     if t == "cnic":
-        return "13 digits, shown as XXXXX-XXXXXXX-X"
+        return ("a Pakistani CNIC: exactly 13 digits as XXXXX-XXXXXXX-X"
+                f"{boxes} (each dash takes a box). "
+                "The first digit is the issuing region, 1-8, never 0")
     if t == "iban":
-        return "24 characters beginning PK, then digits/letters"
+        return ("a Pakistani IBAN: exactly 24 characters - PK, 2 digits, a 4-LETTER bank "
+                f"code (HBL is HABB), then 16 digits/letters{boxes}")
+    if t == "passport":
+        return "a Pakistani passport number: 2 capital letters then 7 digits"
     if t == "email":
         return "an e-mail address"
+    if t == "mobile":
+        return ("a Pakistani mobile: exactly 11 digits starting 03, as 03XX-XXXXXXX"
+                f"{boxes} (the dash takes one). Real prefixes are 0300-0349 and 0355")
     if t == "phone":
-        return "a phone number (digits, may contain a dash)"
+        return ("a Pakistani landline: the city code then the subscriber number, one dash "
+                f"between them{boxes}. Karachi 021 and Lahore 042 take 8-digit subscriber "
+                "numbers (11 digits in total); every other city takes 7 (10 in total) - "
+                "e.g. 051 Islamabad, 061 Multan, 091 Peshawar, 042 Lahore")
     if t == "amount":
-        return "a money amount (digits)"
-    if t in ("integer", "postcode", "digits", "account"):
+        return ("an amount in Pakistani Rupees - digits, possibly with thousands commas "
+                "and a trailing /- ; transcribe the digits as written")
+    if t == "postcode":
+        return "a Pakistani postal code: exactly 5 digits (e.g. 74000 Karachi, 54000 Lahore)"
+    if t == "ntn":
+        return ("an FBR National Tax Number: 7 digits. An individual may instead write "
+                "their 13-digit CNIC, which is also valid")
+    if t in ("integer", "digits", "account"):
         return f"digits only{f', {cells} boxes' if cells else ''}"
     if t == "name":
-        return "a person or company name"
+        return ("a Pakistani person or company name: letters and spaces only, no digits. "
+                "It may contain an initial with a full stop")
+    if ADDRESSY.search(label):
+        return ("an address line. It mixes letters and digits and may contain / or - "
+                "(e.g. House No. 43/2, Flat 5-B, Street 12). After Block, Sector or Phase "
+                "either a DIGIT or a LETTER is possible - copy exactly which one is written")
+    if PLACEY.search(label):
+        return ("a Pakistani place name - letters, spaces and hyphens. Unfamiliar spellings "
+                "are normal here (Jhang, Toba Tek Singh, Gulshan-e-Iqbal, Nazimabad, "
+                "Bahawalpur). Copy the letters exactly; never substitute a better-known "
+                "name that merely looks similar")
     return f"{cells} character boxes" if cells else "free text"
 
 
-def build_prompt(items: list[dict], conts: dict | None = None) -> str:
+def build_prompt(items: list[dict], conts: dict | None = None,
+                 model: str = "") -> str:
     conts = conts or {}
 
     def line(i, it):
@@ -112,16 +159,35 @@ def build_prompt(items: list[dict], conts: dict | None = None) -> str:
         return f'{i}. "{it["label"]}" - expect {describe(it)}{wrapped}'
 
     lines = "\n".join(line(i, it) for i, it in enumerate(items, 1))
+
+    # Each reader is warned about the mistake it actually makes. The OCR model has no
+    # language prior, so it needs the digit counts held in front of it and must be told to
+    # stop talking. The general VLM has too strong a prior: it pulled "Convention" to
+    # "Conversion" and "35810" to "35820" because the commoner form fitted better.
+    if model == MODEL_NUM:
+        care = """These are Pakistani bank form fields. Count the characters before you answer:
+if the field says 11 digits, return exactly 11 digits - do not pad and do not drop one.
+Read each digit from its own pen strokes, not from what would look like a plausible number.
+Give the value only. Do not repeat it, do not explain it, do not add any other text."""
+    else:
+        care = """These are Pakistani bank form fields, filled in by hand in Pakistan.
+Transcribe exactly what the pen shows, letter by letter. Do NOT change an unusual word into
+a more common one - Pakistani names, companies and places are often unfamiliar, and the
+unfamiliar reading is usually the correct one. Never "tidy" a value: keep the writer's
+spelling, spacing and capitalisation."""
+
     return f"""This image contains {len(items)} separate fields cropped from one scanned bank form.
 They are stacked vertically, separated by black lines, and numbered on the left.
 
 The numbered fields are:
 {lines}
 
+{care}
+
 For each number, read ONLY the handwritten value in that strip.
-Ignore printed form text, printed labels and box borders - the handwriting is what a
-customer wrote by hand. Transcribe exactly what is written; do not correct spelling or
-invent anything. If a strip contains no handwriting, use "EMPTY".
+Ignore printed form text, printed labels, Urdu text and box borders - some of it bleeds into
+the crop, and a printed unit such as "years" beside a handwritten "20" is NOT part of the
+answer. If a strip contains no handwriting, use "EMPTY".
 
 Reply with JSON only: one entry for every number from 1 to {len(items)}, mapping the
 number to the value you read."""
@@ -236,7 +302,7 @@ def keys_schema(n: int) -> dict:
 def reader_for(field: dict) -> str:
     """Which model reads this field. The template already told us every field's type at
     schema time, so the routing costs nothing to work out."""
-    return MODEL_NUM if infer_type(field) in NUMERIC else MODEL
+    return MODEL_NUM if infer_type(field) in OCR_TYPES else MODEL
 
 
 def first_line(v: str) -> str:
@@ -267,7 +333,7 @@ def generate(prompt: str, img_b64: str, fmt, num_predict: int, model: str = "") 
 def read_batch(items: list[dict], row_h: int = ROW_H, max_w: int = MAX_W,
                model: str = "", conts: dict | None = None) -> dict[str, str]:
     model = model or MODEL
-    raw = generate(build_prompt(items, conts),
+    raw = generate(build_prompt(items, conts, model),
                    png_b64(montage(items, row_h, max_w, conts)),
                    keys_schema(len(items)), 80 + 40 * len(items), model)
     try:

@@ -54,7 +54,6 @@
   "Purpose of CIF": "Regular",
   "SBP Code": "S:31 Self-Employed",
   "Person (PEP) or a Family Member/Close Relative/Associate of a PEP?": "No",
-  "What isthe purpose of thisform?": "Customer Information Update",
   "Is the customer visually impaired?": "No",
   "Title": "Mr.",
   "Gender": "Male",
@@ -65,6 +64,7 @@
   "Education": "Bachelor's",
   "Are you an existing HBL customer?": "Yes",
   "Property Status (Residential)": "Rented",
-  "Type of Accommodation": "House"
+  "Type of Accommodation": "House",
+  "What is the purpose of this form?": "Customer Information Update"
  }
 }

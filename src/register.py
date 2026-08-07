@@ -241,23 +241,41 @@ def register_page(tpl_page, scan_page, H=None, inl=0):
 
 
 def run(scan_pdf: str, outdir: str, identify: bool = True,
-        max_pages: int | None = None, progress=None) -> list[dict]:
-    """max_pages: only the first N pages of the scan are processed (the UI exposes
-    this so a user can extract just the pages they care about).
-    progress: optional callable(done, total, message) for UI reporting."""
+        max_pages: int | None = None, pages: list[int] | None = None,
+        progress=None) -> list[dict]:
+    """pages: the 1-based scan pages to process, in any order - [2] reads page 2 alone.
+    max_pages: the older "first N pages" form, kept because it is the simpler ask.
+    Pass one or the other; `pages` wins if both are given.
+    progress: optional callable(done, total, message) for UI reporting.
+
+    A selection is not the same as a prefix. Page identification still uses each page's
+    real position in the scan to decide which template page to try first, so asking for
+    page 2 alone matches it against template page 2 rather than page 1.
+    """
     os.makedirs(outdir, exist_ok=True)
     tpl_doc, scan_doc = fitz.open(BLANK), fitz.open(scan_pdf)
 
     # template features are reused for every scan page, so compute them once
     tpl_kds = [orb_features(render_gray(p, MATCH_DPI)) for p in tpl_doc]
 
-    n_scan = len(scan_doc) if max_pages is None else min(len(scan_doc), max(1, max_pages))
+    if pages:
+        want = sorted({p for p in pages if 1 <= p <= len(scan_doc)})
+        if not want:
+            raise ValueError(f"none of pages {sorted(set(pages))} exist in a "
+                             f"{len(scan_doc)}-page document")
+    elif max_pages is not None:
+        want = list(range(1, min(len(scan_doc), max(1, max_pages)) + 1))
+    else:
+        want = list(range(1, len(scan_doc) + 1))
+    n_scan = len(want)
 
     claimed: dict[int, int] = {}
     report = []
-    for si in range(n_scan):
+    for done, page_no in enumerate(want):
+        si = page_no - 1
         if progress:
-            progress(si, n_scan, f"Aligning page {si + 1} of {n_scan}")
+            progress(done, n_scan, f"Aligning page {page_no}"
+                                   f"{f' ({done + 1} of {n_scan})' if n_scan > 1 else ''}")
         scan_kd = orb_features(render_gray(scan_doc[si], MATCH_DPI))
         prefer = min(si, len(tpl_kds) - 1)
         if identify:
@@ -300,10 +318,9 @@ def run(scan_pdf: str, outdir: str, identify: bool = True,
         print(f"  scan p{si + 1} -> tpl p{tp}: inliers={inl:<4} cover={cover:.3f} "
               f"off={off:.2f}px  {'OK' if not problems else 'REVIEW: ' + ', '.join(problems)}")
 
-    # Only complain about template pages the user actually asked us to cover: with
-    # max_pages set, the later pages are absent on purpose.
-    expected = set(range(1, len(tpl_doc) + 1)) if max_pages is None \
-        else set(range(1, min(len(tpl_doc), n_scan) + 1))
+    # Only complain about template pages the run was actually asked to cover - the rest
+    # are absent on purpose, which is the whole point of selecting pages.
+    expected = {p for p in want if p <= len(tpl_doc)}
     missing = sorted(expected - set(claimed))
     if missing:
         print(f"  template pages with no scan: {missing}")
@@ -311,7 +328,7 @@ def run(scan_pdf: str, outdir: str, identify: bool = True,
         progress(n_scan, n_scan, "Alignment complete")
     with open(os.path.join(outdir, "alignment.json"), "w", encoding="utf-8") as fh:
         json.dump({"source": os.path.basename(scan_pdf), "pages": report,
-                   "scanned_pages": n_scan,
+                   "scanned_pages": n_scan, "requested_pages": want,
                    "missing_template_pages": missing}, fh, indent=1)
     return report
 
@@ -319,7 +336,10 @@ def run(scan_pdf: str, outdir: str, identify: bool = True,
 if __name__ == "__main__":
     import sys
     pdf = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "Forms", "Cif-form.pdf")
+    # any further arguments are the pages to register: `register.py form.pdf 2` does p2 only
+    sel = [int(a) for a in sys.argv[2:] if a.isdigit()] or None
     name = os.path.splitext(os.path.basename(pdf))[0]
     out = os.path.join(ROOT, "build", "registered", name)
-    print(f"registering {os.path.basename(pdf)} -> {out}")
-    run(pdf, out)
+    print(f"registering {os.path.basename(pdf)}"
+          f"{f' pages {sel}' if sel else ' (all pages)'} -> {out}")
+    run(pdf, out, pages=sel)

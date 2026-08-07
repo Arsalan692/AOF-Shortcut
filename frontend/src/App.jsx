@@ -7,6 +7,17 @@ const PILL = { high: 'High', low: 'Review' }
 const MAX_PAGES = 9
 
 const isEmpty = (v) => v === null || v === undefined || v === '' || v === 'null'
+/* "1, 2, 5" but "2-5" when they run on - a selection reads better collapsed. */
+function listPages(ps) {
+  if (!ps || !ps.length) return ''
+  const runs = []
+  for (const p of [...ps].sort((a, b) => a - b)) {
+    const last = runs[runs.length - 1]
+    if (last && p === last[1] + 1) last[1] = p
+    else runs.push([p, p])
+  }
+  return runs.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(', ')
+}
 const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 
 function download(filename, text, type) {
@@ -28,9 +39,47 @@ function ConfPill({ conf }) {
 
 /* One field row. Clicking it reveals the exact patch of the scan the value came
    from — the fastest way to settle whether a flagged value is actually wrong. */
-function FieldRow({ jobId, rec }) {
+function FieldRow({ jobId, rec: incoming, onEdited }) {
   const [open, setOpen] = useState(false)
+  const [rec, setRec] = useState(incoming)
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [editErr, setEditErr] = useState(null)
+  // a fresh extraction replaces the record underneath us
+  useEffect(() => { setRec(incoming) }, [incoming])
+
   const showable = rec.kind !== 'checkbox'
+  const isBox = rec.kind === 'checkbox'
+
+  async function save(value) {
+    setBusy(true); setEditErr(null)
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/fields/${rec.field}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      })
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`)
+      const { field } = await r.json()
+      setRec(field); onEdited?.(field)
+    } catch (e) { setEditErr(e.message) } finally { setBusy(false) }
+  }
+
+  async function revert() {
+    setBusy(true); setEditErr(null)
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/fields/${rec.field}/edit`, { method: 'DELETE' })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const { field } = await r.json()
+      setRec(field); setDraft(field.value == null ? '' : String(field.value)); onEdited?.(field)
+    } catch (e) { setEditErr(e.message) } finally { setBusy(false) }
+  }
+
+  function toggleOpen() {
+    if (!showable) return
+    if (!open) setDraft(rec.value == null ? '' : String(rec.value))
+    setOpen((o) => !o)
+  }
   // a wrapped second line: one answer written across two boxes on the page, so it is
   // shown tucked under its first line rather than as another field of the same name
   const cont = Boolean(rec.continuation_of)
@@ -39,10 +88,10 @@ function FieldRow({ jobId, rec }) {
     : rec.value
 
   return (
-    <div className={`frow ${cont ? 'cont' : ''} ${rec.needs_review ? 'flagged' : ''} ${open ? 'open' : ''}`}>
+    <div className={`frow ${cont ? 'cont' : ''} ${rec.needs_review ? 'flagged' : ''} ${rec.edited ? 'edited' : ''} ${open ? 'open' : ''}`}>
       <button
         className="frow-main"
-        onClick={() => showable && setOpen((o) => !o)}
+        onClick={toggleOpen}
         aria-expanded={open}
         disabled={!showable}
       >
@@ -55,11 +104,24 @@ function FieldRow({ jobId, rec }) {
           {isEmpty(val)
             ? <span className="value empty">Not filled</span>
             : <span className="value">{String(val)}</span>}
+          {rec.edited && <span className="frow-edited" title="corrected by hand">edited</span>}
           <ConfPill conf={rec.confidence} />
           {showable && <span className="frow-chev" aria-hidden="true" />}
         </span>
       </button>
       {rec.note && <div className="frow-note">{rec.note}</div>}
+      {isBox && (
+        <div className="frow-boxedit">
+          <button className="btn btn-tiny" disabled={busy} onClick={() => save(!rec.value)}>
+            {rec.value ? 'Mark as not ticked' : 'Mark as ticked'}
+          </button>
+          {rec.edited && (
+            <button className="btn btn-tiny ghost" disabled={busy} onClick={revert}>
+              Undo
+            </button>
+          )}
+        </div>
+      )}
       {open && showable && (
         <div className="frow-crop">
           <img
@@ -67,6 +129,44 @@ function FieldRow({ jobId, rec }) {
             alt={`Scan of ${rec.label}`}
             loading="lazy"
           />
+          {/* Correcting a value is the point of the review list, so the box to type in sits
+              directly beneath the handwriting it is being checked against. */}
+          <div className="frow-edit">
+            <label className="frow-edit-lab" htmlFor={`ed-${rec.field}`}>Correct this value</label>
+            <div className="frow-edit-row">
+              <input
+                id={`ed-${rec.field}`}
+                className="frow-input"
+                value={draft}
+                placeholder="Type the value as written"
+                disabled={busy}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') save(draft)
+                  if (e.key === 'Escape') setDraft(rec.value == null ? '' : String(rec.value))
+                }}
+              />
+              <button
+                className="btn btn-tiny"
+                disabled={busy || draft === (rec.value == null ? '' : String(rec.value))}
+                onClick={() => save(draft)}
+              >
+                {busy ? 'Saving…' : 'Save'}
+              </button>
+              {rec.edited && (
+                <button className="btn btn-tiny ghost" disabled={busy} onClick={revert}>
+                  Undo
+                </button>
+              )}
+            </div>
+            {rec.edited && (
+              <div className="frow-was">
+                model read <span className="frow-was-v">{isEmpty(rec.edited_from)
+                  ? '(nothing)' : String(rec.edited_from)}</span>
+              </div>
+            )}
+            {editErr && <div className="frow-editerr">{editErr}</div>}
+          </div>
           <div className="frow-meta">
             <span>{rec.type}</span>
             <span>page {rec.page}</span>
@@ -186,7 +286,9 @@ function Results({ job, onReset }) {
         {stats.review ? `${stats.review} field${stats.review === 1 ? '' : 's'} need review` : 'All fields passed their checks'}
         <span className="note">
           &nbsp;&middot;&nbsp;{stats.filled} values read, {stats.ticked} boxes ticked,
-          &nbsp;{data.pages_scanned} page{data.pages_scanned === 1 ? '' : 's'} scanned
+          &nbsp;{Array.isArray(data.pages_scanned)
+            ? `page${data.pages_scanned.length === 1 ? '' : 's'} ${listPages(data.pages_scanned)} scanned`
+            : `${data.pages_scanned} pages scanned`}
         </span>
       </div>
 
@@ -253,12 +355,12 @@ function Pipeline({ job }) {
       <div className="pl-head"><span className="live" />Extracting {job.filename}</div>
 
       <div className="pl-pages">
-        {Array.from({ length: job.pages }, (_, i) => (
+        {(job.pages || []).map((p, i) => (
           <img
-            key={i}
+            key={p}
             className={`pl-page ${idx > 0 ? 'ready' : ''}`}
-            src={`/api/jobs/${job.job_id}/pages/${i + 1}/preview.png?width=320`}
-            alt={`Page ${i + 1}`}
+            src={`/api/jobs/${job.job_id}/pages/${p}/preview.png?width=320`}
+            alt={`Page ${p}`}
             onError={(e) => { e.currentTarget.style.visibility = 'hidden' }}
           />
         ))}
@@ -339,7 +441,7 @@ function Typewriter({ segments, speed = 46, startDelay = 350 }) {
 export default function App() {
   const [file, setFile] = useState(null)
   const [pageCount, setPageCount] = useState(null)
-  const [pages, setPages] = useState(1)
+  const [pages, setPages] = useState([1])
   const [job, setJob] = useState(null)
   const [status, setStatus] = useState('idle')   // idle | processing | done | error
   const [error, setError] = useState(null)
@@ -359,7 +461,7 @@ export default function App() {
     setJob(null)
     setStatus('idle')
     setError(null)
-    setPages(1)
+    setPages([1])
     setPageCount(null)
     // Read the page count in the browser so the page selector knows its range
     // before anything is uploaded.
@@ -420,7 +522,8 @@ export default function App() {
     try {
       const form = new FormData()
       form.append('file', file)
-      form.append('pages', String(pages))
+      // a selection, not a count: '2' means page 2 alone
+      form.append('pages', pages.join(','))
       const res = await fetch('/api/extract', { method: 'POST', body: form })
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}))
@@ -439,11 +542,20 @@ export default function App() {
     setStatus('idle')
     setError(null)
     setPageCount(null)
-    setPages(1)
+    setPages([1])
   }, [])
 
   const maxPages = Math.min(pageCount || MAX_PAGES, MAX_PAGES)
+
+  // Selecting pages, not a page count. Kept sorted so "pages 2, 5" always reads in order.
+  const togglePage = (n) => setPages((prev) => prev.includes(n)
+    ? prev.filter((p) => p !== n)
+    : [...prev, n].sort((a, b) => a - b))
   const modelDown = health && !health.model_ready
+  // a missing OCR reader does not stop a run, it quietly costs accuracy on the digits -
+  // which is exactly the kind of thing that should not be silent
+  const digitReader = health?.readers?.find((r) => r.role === 'digits')
+  const degraded = Boolean(health?.model_ready && health?.degraded)
 
   return (
     <div className="app">
@@ -500,7 +612,13 @@ export default function App() {
             {health?.schema_ready && (
               <div className="hero-facts">
                 <span><b>{health.schema_fields}</b> fields mapped</span>
-                <span><b>{health.model}</b>{modelDown ? ' (offline)' : ''}</span>
+                {(health.readers || [{ model: health.model, ready: health.model_ready, role: 'words' }])
+                  .map((r) => (
+                    <span key={r.model} title={r.reads}>
+                      <b>{r.model}</b>
+                      {r.ready ? '' : r.required ? ' (offline)' : ' (missing)'}
+                    </span>
+                  ))}
               </div>
             )}
           </header>
@@ -518,6 +636,19 @@ export default function App() {
               The local vision model is not reachable
               <span className="note">
                 &nbsp;&middot;&nbsp;start Ollama and pull <code>{health.model}</code>
+              </span>
+            </div>
+          )}
+
+          {degraded && status === 'idle' && (
+            <div className="banner review alert-wide">
+              <span className="dot" />
+              Digit reader missing &mdash; numbers will be less reliable
+              <span className="note">
+                &nbsp;&middot;&nbsp;pull <code>{digitReader?.model}</code> so dates, CNICs,
+                phone numbers and amounts are read by the OCR model.
+                Without it {health.model} reads them, and its digit mistakes are
+                well-formed &mdash; they pass every format check.
               </span>
             </div>
           )}
@@ -565,36 +696,42 @@ export default function App() {
               <div className="card">
                 <div className="card-title">Pages to scan</div>
                 <p className="card-sub">
-                  Pages are read from the start of the document. Fewer pages means a faster run.
+                  Pick any pages you like &mdash; they need not start at page 1, and page 2
+                  on its own is a valid choice. Fewer pages means a faster run.
                 </p>
                 <div className="page-picker">
                   {Array.from({ length: maxPages }, (_, i) => i + 1).map((n) => (
                     <button
                       key={n}
-                      className={`page-chip ${pages === n ? 'on' : ''}`}
-                      onClick={() => setPages(n)}
-                      title={`Scan the first ${n} page${n === 1 ? '' : 's'}`}
+                      className={`page-chip ${pages.includes(n) ? 'on' : ''}`}
+                      onClick={() => togglePage(n)}
+                      title={pages.includes(n) ? `Skip page ${n}` : `Also scan page ${n}`}
                     >
                       {n}
                     </button>
                   ))}
                   {maxPages > 1 && (
                     <button
-                      className={`page-chip all ${pages === maxPages ? 'on' : ''}`}
-                      onClick={() => setPages(maxPages)}
+                      className={`page-chip all ${pages.length === maxPages ? 'on' : ''}`}
+                      onClick={() => setPages(pages.length === maxPages
+                        ? [1]
+                        : Array.from({ length: maxPages }, (_, i) => i + 1))}
                     >
-                      All {maxPages}
+                      {pages.length === maxPages ? 'Clear' : `All ${maxPages}`}
                     </button>
                   )}
                 </div>
                 <div className="page-summary">
-                  Scanning {pages === 1 ? 'page 1' : `pages 1–${pages}`} of {pageCount || '?'}
+                  {pages.length === 0
+                    ? 'Select at least one page'
+                    : `Scanning ${pages.length === 1 ? 'page' : 'pages'} ${listPages(pages)} of ${pageCount || '?'}`}
                 </div>
               </div>
 
               <div className="preview-actions">
                 <button className="btn btn-ghost" onClick={reset}>Choose another</button>
-                <button className="btn btn-primary" onClick={extract}>Extract fields</button>
+                <button className="btn btn-primary" onClick={extract}
+                        disabled={pages.length === 0}>Extract fields</button>
               </div>
               <p className="hint">Runs locally &middot; a few minutes per page on CPU, far quicker on a GPU</p>
             </div>

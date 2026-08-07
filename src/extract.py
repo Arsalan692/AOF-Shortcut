@@ -134,8 +134,12 @@ def build(doc: str) -> dict:
                                    or page_problems)
         records.append(rec)
 
+    # cross-field rules also need the ticked options: the CNIC's last digit encodes gender,
+    # which only means something alongside the Gender question
+    ticks = {r["group"] or r["label"]: r["label"]
+             for r in records if r["kind"] == "checkbox" and r["value"]}
     issues = cross_check({r["field"]: {"value": r["value"], "empty": r["value"] in (None, "")}
-                          for r in records if r["kind"] != "checkbox"})
+                          for r in records if r["kind"] != "checkbox"}, ticks)
     return {"document": doc, "fields": records, "cross_check": issues,
             "alignment": [p for p in page_ok.values()]}
 
@@ -147,6 +151,13 @@ def answers_view(records) -> dict:
     A wrapped second line is one answer split across two boxes on the page, so it is
     rejoined here rather than reported as its own field. The per-field records stay
     one-per-box, because each line still has its own crop to review.
+
+    Labels are not unique, so an entry must never overwrite another one: page 1 has two
+    "P.A. No." boxes, page 2 repeats the whole address block for the office address, and
+    page 4 carries "Name of the Bank/DFI (row 1)" inside six different tables. Keying on
+    the label alone silently dropped 68 values across the form. A table name disambiguates
+    where there is one, and a counter covers the rest - the summary is allowed to be ugly,
+    it is not allowed to lose an answer.
     """
     out: dict = defaultdict(dict)
     groups: dict = defaultdict(list)
@@ -154,6 +165,14 @@ def answers_view(records) -> dict:
     for r in records:
         if r.get("continuation_of"):
             conts[r["continuation_of"]].append(r)
+
+    def put(section: str, label: str, value) -> None:
+        sec = out[section or "(unsectioned)"]
+        key, n = label, 1
+        while key in sec:
+            n += 1
+            key = f"{label} ({n})"
+        sec[key] = value
 
     for r in records:
         if r["kind"] == "checkbox":
@@ -165,11 +184,12 @@ def answers_view(records) -> dict:
         # a line often ends with the comma that leads into the next one
         parts = [str(p).strip().rstrip(",").strip() for p in parts if p not in (None, "")]
         if parts:
-            out[r["section"] or "(unsectioned)"][r["label"]] = ", ".join(parts)
+            label = f"{r['group']} - {r['label']}" if r.get("group") else r["label"]
+            put(r["section"], label, ", ".join(parts))
     for (section, q), members in groups.items():
         sel = [m["label"] for m in members if m["value"]]
         if sel:
-            out[section or "(unsectioned)"][q] = sel if len(sel) > 1 else sel[0]
+            put(section, q, sel if len(sel) > 1 else sel[0])
     return {k: out[k] for k in out}
 
 

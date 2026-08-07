@@ -40,6 +40,8 @@ PAD_X = 2.0        # pt
 PAD_Y = 3.0        # pt - kept tight; form rows are only ~16pt apart
 BLOCK_PAD_Y = 2.0
 UPSCALE = 2        # small boxes are ~50px tall at 300 dpi; VLMs read 2x much better
+GHOST_K = 5        # erasing a foreign stroke must also cover its sub-threshold rim, or the
+                   # rim survives as a glowing outline (see render_crop)
 
 READABLE = ("text", "grid", "block")
 
@@ -93,6 +95,10 @@ OWN_INSET = 1.0    # boxes are shrunk this much when seeding ownership so that
 # of the box to be claimed at all; strokes that then run further are recovered by
 # completing their connected component.
 OWN_MAX_DIST = 8.0
+# Share of a stroke's connected component this field must already hold before the whole
+# component is claimed. Above it, the stroke is one answer leaning past the boundary; near
+# half, it is a blob two answers wrote into each other and must stay cut.
+COMP_MAJORITY = 0.6
 
 
 def ownership_labels(shape, fields) -> tuple[np.ndarray, np.ndarray, dict]:
@@ -133,7 +139,7 @@ def window(shape, rect):
             min(w, int((rect[2] + MAX_GROW_X) * S)), min(h, int((rect[3] + MAX_GROW_Y) * S)))
 
 
-def owned_mask(ink, dist, labels, cc, lab, rect):
+def owned_mask(ink, dist, labels, cc, lab, rect, reclaim: bool = False):
     """(mask, window) - the ink this field owns.
 
     Three rules, in order: the pixel's nearest box must be ours (so a blob straddling
@@ -152,20 +158,39 @@ def owned_mask(ink, dist, labels, cc, lab, rect):
         return np.zeros_like(mine), (x0, y0, x1, y1)
     ids = np.unique(cc[win][near])
     ids = ids[ids != 0]
-    return mine & np.isin(cc[win], ids), (x0, y0, x1, y1)
+    comp = cc[win]
+    owned = mine & np.isin(comp, ids)
+
+    # Reclaim a stroke that merely leans into the next row. Nearest-box ownership cuts along
+    # the midline between two boxes, and grid digits are written far taller than their 12pt
+    # cells: the bottom of "02136102837" fell on the row below, so it was both excluded from
+    # the crop and painted out as foreign ink - which turned the 2 into a 9 and the 3 into a
+    # 2, because a digit loses its identity when its base is missing.
+    #
+    # The test is how much of the component we already hold. One answer leaning past the
+    # boundary is still overwhelmingly ours; a blob genuinely shared by two answers - the
+    # "Karachi East" that touches the next field's "Karachi" - is split near half and stays
+    # cut, which is the case nearest-box ownership exists to handle.
+    if reclaim:
+        for cid in ids:
+            m = comp == cid
+            total = int(m.sum())
+            if total and int((mine & m).sum()) / total >= COMP_MAJORITY:
+                owned |= m
+    return owned, (x0, y0, x1, y1)
 
 
 TRIM_PCT = 0.4   # ignore this share of extreme owned pixels when sizing the crop
 
 
-def owned_extent(ink, dist, labels, cc, lab, rect) -> list:
+def owned_extent(ink, dist, labels, cc, lab, rect, reclaim: bool = False) -> list:
     """The rect grown to contain the strokes this field owns, in PDF points.
 
     Extremes are trimmed by a fraction of a percent: a single stray speck that
     survived cleaning would otherwise stretch the crop tens of points and drag a
     neighbouring row into view.
     """
-    m, (x0, y0, _, _) = owned_mask(ink, dist, labels, cc, lab, rect)
+    m, (x0, y0, _, _) = owned_mask(ink, dist, labels, cc, lab, rect, reclaim)
     if m is None or not m.any():
         return list(rect)
     ys, xs = np.nonzero(m)
@@ -193,11 +218,30 @@ def render_crop(reg, ink, owned, win, ext, pad_x, pad_y) -> np.ndarray:
     if owned is not None and ink is not None:
         foreign = (ink[wy0:wy1, wx0:wx1] > 0) & ~owned
         if foreign.any():
-            paper = int(np.percentile(patch, 92))     # local unmarked paper level
-            patch[foreign] = paper
+            # Paint with the paper *immediately around* each stroke, not one level for the
+            # whole window. A single 92nd-percentile value is the brightest paper anywhere in
+            # the crop, so on a grey CamScanner band an erased stroke came out brighter than
+            # its surroundings - the removed letters glowed white instead of disappearing.
+            # A wide median is a local background estimate: over a 31px window a pen stroke
+            # is the minority, so the median is the paper the stroke sits on.
+            paper = cv2.medianBlur(patch, 31)
+            # The ink mask is a threshold, so each foreign stroke keeps an anti-aliased rim
+            # a pixel or two wide that falls below it. Filling only the mask replaced the
+            # dark core with paper brighter than the surrounding band and left that rim
+            # behind - a glowing hollow outline of the letter we meant to remove. Widen the
+            # fill to swallow the rim.
+            #
+            # It must never widen into ink this field owns: an overflowing neighbour
+            # physically crosses the answer, so a blind dilation would erase parts of the
+            # value being read. Owned ink is protected with a halo of its own, which leaves
+            # a short stub of ghost at each crossing - the price of not damaging the answer.
+            wide = cv2.dilate(foreign.astype(np.uint8), np.ones((GHOST_K, GHOST_K), np.uint8))
+            guard = cv2.dilate(owned.astype(np.uint8), np.ones((3, 3), np.uint8))
+            fill = (wide > 0) & (guard == 0)
+            patch[fill] = paper[fill]
             # feather so the erasure does not leave hard-edged ghosts
             blur = cv2.GaussianBlur(patch, (5, 5), 0)
-            grown = cv2.dilate(foreign.astype(np.uint8), np.ones((3, 3), np.uint8))
+            grown = cv2.dilate(fill.astype(np.uint8), np.ones((3, 3), np.uint8))
             patch = np.where(grown > 0, blur, patch).astype(np.uint8)
 
     # ext is in page points; convert to offsets inside the window
@@ -264,8 +308,11 @@ def run(doc: str, upscale: int = UPSCALE) -> list[dict]:
             pad_y = BLOCK_PAD_Y if f["kind"] == "block" else PAD_Y
             # crop the box grown to its own handwriting, not the bare printed box
             if ink is not None:
-                ext = owned_extent(ink, dist, labels, cc, lab, f["rect"])
-                om, win = owned_mask(ink, dist, labels, cc, lab, f["rect"])
+                # only a character grid may reclaim a leaning stroke: its printed cells
+                # make "this ink is in my box" a fact, which free text cannot claim
+                reclaim = f["kind"] == "grid"
+                ext = owned_extent(ink, dist, labels, cc, lab, f["rect"], reclaim)
+                om, win = owned_mask(ink, dist, labels, cc, lab, f["rect"], reclaim)
                 c = render_crop(reg, ink, om, win, ext, PAD_X, pad_y)
             else:
                 ext, om = list(f["rect"]), None
@@ -280,7 +327,8 @@ def run(doc: str, upscale: int = UPSCALE) -> list[dict]:
             # an interior-only test would call those fields empty and silently drop
             # the answer. raw asks "is there any stroke at all", core asks "is it a
             # pen stroke or just border residue".
-            oe = owned_mask(ink_e, dist, labels, cc_e, lab, f["rect"])[0] if ink_e is not None else None
+            oe = owned_mask(ink_e, dist, labels, cc_e, lab, f["rect"],
+                            f["kind"] == "grid")[0] if ink_e is not None else None
             raw = int(om.sum()) if om is not None else -1
             core = int(oe.sum()) if oe is not None else -1
             base = interior_ink(tpl_ink, f["rect"])

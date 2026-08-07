@@ -56,12 +56,27 @@ a timer: each stage reports through a callback, weighted by where the time actua
 | GET | `/api/jobs/{id}` | progress while running, the result when done |
 | GET | `/api/jobs/{id}/pages/{n}/preview.png` | the aligned page |
 | GET | `/api/jobs/{id}/fields/{fid}/crop.png` | the exact patch a value was read from |
+| PATCH | `/api/jobs/{id}/fields/{fid}` | correct one value by hand — `{"value": …}` |
+| DELETE | `/api/jobs/{id}/fields/{fid}/edit` | undo that correction |
 | GET | `/api/jobs/{id}/download.{json,csv}` | the assembled output |
 | DELETE | `/api/jobs/{id}` | delete the upload and its artefacts |
 | GET | `/api/health` | schema + model readiness |
 
-`pages` selects how many pages to read **from the start** of the document, and is the
-main lever on runtime — a one-page run costs roughly a ninth of a full form.
+`pages` is a **selection, not a count**: `2` reads page 2 on its own, `1,3` reads those two,
+`2-4` a range, and `all` (or omitting it) the whole document. It is the main lever on
+runtime — a one-page run costs roughly a ninth of a full form. A selection is not the same
+as a prefix, which matters for page identification: each page is matched using its real
+position in the scan, so asking for page 2 alone tries it against template page 2 rather
+than page 1. `src/register.py form.pdf 2` does the same from the command line.
+
+**A correction is recorded, not written over the extraction.** `PATCH` stores the new value
+in `build/output/<job>.edits.json` alongside the value it replaced, then re-assembles the
+downloads. The pipeline output therefore stays exactly what the models produced, every
+correction can be undone, and `edited_from` keeps the original visible in the record.
+
+Crucially a hand-typed value is **re-validated, not trusted**: it goes through the same
+format rules as a read one, so typing `0399-1234567` into a mobile field comes back flagged
+with *"0399 is not a Pakistani mobile prefix"*. A reviewer can make a typo too.
 
 ## Run the web app
 
@@ -90,11 +105,23 @@ Working on the frontend? Run `npm run dev` in `frontend/` as well and use
 > `app:app` has to be importable, and it imports `jobs` from the same folder.
 
 Ollama must be running with **both** `qwen2.5vl:7b` and `glm-ocr` pulled — the first reads
-words, the second reads digits (see *Two readers* below). If `glm-ocr` is missing the run
-still completes: numeric fields fall back to the VLM with a printed warning, at the cost of
-digit errors it cannot detect. `GET /api/health` reports whether the model and schema are
-ready, and the UI shows a banner if the model is unreachable. Override with `HBL_VLM`,
+words, the second reads digits (see *Two readers* below). Override with `HBL_VLM`,
 `HBL_VLM_NUM` and `OLLAMA_HOST`.
+
+`GET /api/health` reports each reader separately, because the two failures are not
+equivalent and should not look alike:
+
+| state | `ok` | `degraded` | what the UI shows |
+|---|---|---|---|
+| both readers pulled | `true` | `false` | — |
+| digit reader missing | **`true`** | **`true`** | amber banner; upload still allowed |
+| Ollama unreachable | `false` | `false` | red banner; upload blocked |
+
+Without the word reader nothing can be read at all, so that blocks the upload. Without the
+digit reader the run still finishes — the VLM covers the numeric fields — so it is a warning
+rather than a wall. It is a warning worth making loud, though: the VLM's digit mistakes are
+*well-formed*, so a wrong CNIC is still a valid CNIC and every format check passes it. Being
+quietly less accurate is the failure mode that most deserves saying out loud.
 
 ## Run the pipeline from the command line
 
@@ -120,6 +147,76 @@ because form rows are only ~16pt apart. Crops are therefore sized from the ink i
 a nearest-box ownership partition, a proximity gate, then connected-component
 completion — and other fields' strokes inside the grown rectangle are painted out so
 each crop shows exactly one answer.
+
+**A section heading is text on the form's own heading strip.** Styling does not identify
+one: requiring teal *and* bold left 24 fields unsectioned, because "Residential Address",
+"Work Address" and "Permanent Address" are bold but grey while "Financial Supporter Details
+for Housewives" is teal but not bold. Relaxing to a size threshold instead loses "For Bank
+Use Only" at 10pt and promotes the two document-title lines into sections. What actually
+separates a heading from the title is the pale strip printed behind it — and the title has
+none. The strip test needs one guard: input grids sit on the same strips and print
+placeholder glyphs inside their cells, so the IBAN's `P K` and `H A B B 0` become sections
+and displace the real ones unless headings are also required to start at the page margin
+(x0 27–41; the glyphs are indented to 72–320). Page 4 still needs the teal-and-bold test as
+well — its headings carry no strip, and `UNDERTAKING` is centred. Both tests together,
+unsectioned 24 → 8.
+
+Sectioning is not cosmetic. Page 2 repeats a whole address block for the work address, so
+until the two blocks were named, six pairs of fields — `City`, `Country`, `Street No./Name`,
+`Area/District`, `Post/Zip Code`, `Nearest Landmark` — were indistinguishable.
+
+**The national formats are the strongest validation available.** These are Pakistani
+formats as issued, not patterns copied off the sample form, and they reject values that are
+well-formed in general but impossible here:
+
+| field | rule |
+|---|---|
+| CNIC / SNIC / NICOP | 13 digits as `XXXXX-XXXXXXX-X`; first digit is the issuing region, **1–8**, never 0 |
+| Mobile | 11 digits starting `03`; live ranges are `0300`–`0349` plus SCO `0355` |
+| Landline | area code + subscriber. **Karachi 021 and Lahore 042 issue 8-digit subscribers (11 total); every other city 7 (10 total)** |
+| IBAN | `PK` + 2 check digits + 4-**letter** bank code + 16 alphanumerics = 24, and the bank code **must be HBL's `HABB`** — the form's only IBAN field is the HBL account being opened, so anyone else's code there is a misread |
+| Passport | 2 capital letters then 7 digits |
+| Post code | exactly 5 digits |
+| NTN | 7 digits, 8 with a check digit, or the holder's 13-digit CNIC |
+
+The landline rule is the one that pays. A misread came back as `09136109237` — eleven digits
+on `091`, which is Peshawar and issues seven-digit subscriber numbers. The old rule accepted
+any 9–15 digits and waved it through; the real rule proves it wrong and flags it. That is the
+first of these single-character misreads anything has ever caught, after both a second model
+and heavier prompting failed to.
+
+Length is not the only signal the template gives. A CNIC grid is **15** cells for 13 digits
+and two dashes, a mobile **12** for 11 digits and one, an IBAN **24** for 24 characters — so
+the cell count confirms the format including its separators, and is quoted to the reader as
+something it can count against its own answer.
+
+Two rules span fields rather than validating one. The last digit of a CNIC is the holder's
+gender — odd male, even female — so it must agree with the Gender tick, which is a real check
+on a value no format rule can question, because a wrong digit still yields a well-formed
+CNIC. Phone numbers are also normalised back to the dashed form Pakistan writes them in
+(`0320-5120612`, `021-36102837`) rather than flattened to bare digits.
+
+**A label that asks for a description is not a number.** The money and duration words sit
+inside descriptive labels: "Other Source of Income (Please specify)", "Line of
+Business/Industry/Source of Income", "…the nature and expected months of high turnover".
+Since the type now decides *which model reads the field*, mis-typing one is no longer just a
+failed format check — it routes free text to the OCR reader. `DESCRIPTIVE_RE` is tested
+before `LABEL_TYPES` for that reason; without it six page-2 fields went to the wrong reader.
+
+**Erasing a neighbour's stroke must cover its soft edge too.** Crops are grown to chase
+overflowing handwriting, so they overlap the next row, and the strokes this field does not
+own are filled with the local paper level. Filling only the ink mask was not enough: the
+mask is a threshold, so every erased stroke kept an anti-aliased rim a pixel or two wide
+that fell below it. The dark core became paper *brighter* than the surrounding CamScanner
+band while the rim survived — leaving a glowing hollow outline of the letter that was
+supposed to be gone. `GHOST_K` widens the fill to swallow that rim.
+
+It cannot widen blindly: an overflowing neighbour physically crosses the answer, so a plain
+dilation erases part of the value being read. Owned ink is protected with a halo of its own,
+which leaves a short stub of ghost at each crossing — the price of not damaging the answer.
+Measured per crop: 9–11k pixels of ghost removed, against 0.06–0.25% of the answer's own
+ink touched. Ink statistics are unaffected, because they are measured from the ink layer
+rather than the painted patch.
 
 **Tick boxes are decided per question, not per box.** Ticks are drawn far larger than the
 11pt box and spill across neighbours, so an absolute threshold marks several options per

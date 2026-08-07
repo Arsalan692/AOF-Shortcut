@@ -676,3 +676,48 @@
   }
   .doc { transform: rotateX(6deg) rotateY(-10deg); }
 }
+
+/* ---------------------------------------------------- correcting a value by hand
+   The input sits inside the expanded row, directly under the crop it is checked
+   against, so a reviewer never has to hold a value in their head while they scroll. */
+.frow.edited { border-left: 2px solid var(--green); }
+.frow-edited {
+  margin-left: 0.5rem; padding: 0.05rem 0.4rem; border-radius: 999px;
+  font-size: 0.66rem; letter-spacing: 0.04em; text-transform: uppercase;
+  background: rgba(45, 168, 122, 0.16); color: var(--green);
+}
+.frow-edit { padding: 0.6rem 0 0.2rem; }
+.frow-edit-lab {
+  display: block; margin-bottom: 0.3rem;
+  font-size: 0.72rem; letter-spacing: 0.05em; text-transform: uppercase;
+  color: #93a79c;
+}
+.frow-edit-row { display: flex; gap: 0.45rem; align-items: center; flex-wrap: wrap; }
+.frow-input {
+  flex: 1 1 15rem; min-width: 0;
+  padding: 0.42rem 0.6rem; border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.22); color: inherit;
+  font: inherit; font-size: 0.92rem;
+}
+.frow-input:focus {
+  outline: none; border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(45, 168, 122, 0.18);
+}
+.btn-tiny {
+  padding: 0.36rem 0.7rem; border-radius: 7px; font-size: 0.8rem;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(45, 168, 122, 0.16); color: inherit; cursor: pointer;
+}
+.btn-tiny:hover:not(:disabled) { background: rgba(45, 168, 122, 0.26); }
+.btn-tiny:disabled { opacity: 0.45; cursor: default; }
+.btn-tiny.ghost { background: transparent; }
+.frow-boxedit { display: flex; gap: 0.45rem; padding: 0 0 0.55rem 1.05rem; }
+.frow-was { margin-top: 0.35rem; font-size: 0.78rem; color: #93a79c; }
+.frow-was-v { color: #c9d6cf; font-style: italic; }
+.frow-editerr { margin-top: 0.35rem; font-size: 0.8rem; color: #e2725b; }
+
+@media (prefers-color-scheme: light) {
+  .frow-input { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.16); }
+  .btn-tiny { border-color: rgba(0, 0, 0, 0.16); }
+}

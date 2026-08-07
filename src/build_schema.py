@@ -158,18 +158,94 @@ def split_runs(row: list[Box]) -> list[list[Box]]:
 
 
 # --------------------------------------------------------------- text harvest
+CHAR_GAP_MIN = 0.7      # pt. Measured: a printed space here shows as a 1.0-1.1pt gap
+                        # between glyphs, while letters inside a word sit ~0pt apart.
+
+
 def page_words(page):
-    """(x0,y0,x1,y1,text) for every word, PDF points."""
-    return [(w[0], w[1], w[2], w[3], w[4]) for w in page.get_text("words")]
+    """(x0,y0,x1,y1,text) for every word, PDF points.
+
+    Built from character positions rather than PyMuPDF's own word split, because this
+    template's text layer drops some spaces: "What is the purpose of this form?" arrives
+    as the tokens "isthe" and "thisform", and page 2 has "EmploymentStatus". The space is
+    still on the page - it is a ~1pt gap between glyphs - so a word is cut at a wide gap
+    as well as at a real space character. Without this the gap is invisible to every
+    consumer and the label reaches the UI with the words run together.
+    """
+    out = []
+    for blk in page.get_text("rawdict")["blocks"]:
+        for line in blk.get("lines", []):
+            # One character stream per line, not per span. A word is routinely split across
+            # spans by styling - "Female" arrives as "F" then "emale" - and flushing at a
+            # span boundary turns that into two words, so the label reads "F emale".
+            chars = [(ch, sp.get("size", 10.0))
+                     for sp in line.get("spans", []) for ch in sp.get("chars", [])]
+            cur, box, prev_right = "", None, None
+            for ch, size in chars:
+                c = ch["c"]
+                bx0, by0, bx1, by1 = ch["bbox"]
+                gap_min = max(CHAR_GAP_MIN, 0.06 * size)
+                if c.isspace() or (cur and prev_right is not None
+                                   and bx0 - prev_right > gap_min):
+                    if cur.strip():
+                        out.append((*box, cur))
+                    cur, box = "", None
+                prev_right = bx1
+                if c.isspace():
+                    continue
+                cur += c
+                box = (bx0, by0, bx1, by1) if box is None else (
+                    box[0], min(box[1], by0), max(box[2], bx1), max(box[3], by1))
+            if cur.strip():
+                out.append((*box, cur))
+    return out
+
+
+HEAD_MARGIN_X = 40.0      # a section heading starts at the page margin (measured 27-35)
+
+
+def is_band(color) -> bool:
+    """The pale teal strip the form prints behind every section heading.
+
+    Note it can never match a white input rect: r is capped below 0.95.
+    """
+    if color is None:
+        return False
+    try:
+        r, g, b = color[:3]
+    except (TypeError, ValueError):
+        return False
+    return (0.6 < r < 0.95 and g > r + 0.03 and b > r + 0.02 and abs(g - b) < 0.06)
+
+
+def band_rects(page) -> list:
+    """The heading strips on this page.
+
+    A strip runs the width of the form. The width test is what keeps the same pale fill
+    used for cell shading from being read as a heading: without it the "P K" printed
+    inside the IBAN cells becomes a section and takes over "For Bank Use Only".
+    """
+    wide = page.rect.width * 0.5
+    return [dr["rect"] for dr in page.get_drawings()
+            if is_band(dr.get("fill")) and dr["rect"].width >= wide]
 
 
 def page_sections(page) -> list[tuple[float, str]]:
-    """(y, heading) for teal section headings, top to bottom.
+    """(y, heading) for section headings, top to bottom.
 
-    Headings are teal AND bold. Size alone is not enough to separate them from body
-    text: "Personal Information" is 12pt but "For Bank Use Only" is only 10pt, and a
-    threshold set above 10 silently leaves that whole band unsectioned.
+    A heading is text sitting on the form's pale teal strip. That is the form's own
+    grammar - the same reasoning that makes a white rect an input - and it is the only
+    test that separates a heading from the document title, which is styled identically
+    (12.2pt, bold) but has no strip behind it.
+
+    Styling alone does not work, which is why this was rewritten. Requiring teal *and*
+    bold left 24 fields unsectioned: "Residential Address", "Work Address" and
+    "Permanent Address" are bold but grey, while "Additional Information for Landlords"
+    and "Financial Supporter Details for Housewives" are teal but not bold. Relaxing to
+    a size threshold instead loses "For Bank Use Only" at 10pt and promotes the two
+    title lines into sections.
     """
+    bands = band_rects(page)
     heads = []
     for blk in page.get_text("dict")["blocks"]:
         for line in blk.get("lines", []):
@@ -185,8 +261,26 @@ def page_sections(page) -> list[tuple[float, str]]:
                 if is_teal(rgb):
                     teal = True
             txt = clean_label(txt.strip())
-            if teal and bold and size >= 9.5 and len(txt) > 2 and not txt.startswith("Page"):
-                heads.append((line["bbox"][1], txt))
+            if size < 9.5 or len(txt) <= 2 or txt.startswith("Page"):
+                continue
+            bb = fitz.Rect(line["bbox"])
+
+            # Two kinds of heading, because the form draws them two ways. Teal and bold is
+            # the original test and still the only thing that finds page 4's, which carry
+            # no strip at all and one of which ("UNDERTAKING") is centred at x0 260.
+            styled = teal and bold
+
+            # The rest sit on the pale strip: page 2's "Work Address" and "Permanent
+            # Address" are bold but grey, and its "Financial Supporter Details for
+            # Housewives" is teal but not bold. Requiring the page margin is what stops
+            # the placeholder glyphs printed inside input grids - the IBAN's "P K" and
+            # "H A B B 0", indented to x0 72-320 - from becoming sections and displacing
+            # the real ones. Every genuine heading starts at x0 27-41.
+            banded = bb.x0 <= HEAD_MARGIN_X and any(
+                r.intersects(bb) and r.get_area() > bb.get_area() * 0.8 for r in bands)
+
+            if styled or banded:
+                heads.append((bb.y0, txt))
     heads.sort()
     return heads
 
@@ -249,9 +343,20 @@ TYPOGRAPHY = str.maketrans({
 
 def clean_label(s: str) -> str:
     s = s.translate(TYPOGRAPHY)
+    # The template's text layer loses the space inside some labels, arriving as one token:
+    # "EmploymentStatus", "PrivateService", "FinancialSupporter". Splitting on a
+    # lowercase-then-uppercase boundary restores it and cannot touch an acronym, which has
+    # no such boundary - CNIC, IBAN, NTN, DFI and PKR all come through untouched.
+    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"\s*\((?:Please select|Select one|Select all that apply|if applicable|If applicable)\)\s*",
+    s = re.sub(r"\s*\((?:Please select[^)]*|Select one|Select all that apply|if applicable|If applicable)\)\s*",
                " ", s, flags=re.I)
+    # An unclosed bracket means the probe clipped a printed instruction that runs onto
+    # another line - "Nature of Business (Please select and" is really "(Please select and
+    # provide details)". The instruction is not part of the field's name either way, and
+    # the probe cannot reach the closing line without swallowing neighbouring rows.
+    if s.count("(") > s.count(")"):
+        s = s[:s.rindex("(")].strip()
     # Urdu is drawn as vector outlines, so a bilingual label often leaves the
     # English acronym stranded twice: "CIF Opening Date CIF" -> "CIF Opening Date"
     toks = s.split()
@@ -357,6 +462,43 @@ def probe_left(words, b: Box, start_x: float) -> tuple[str, str]:
     return clean_label(raw), raw
 
 
+def _squash(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _same_question(q: str, carry: dict) -> bool:
+    """Is the text left of this tick box really the question we are already inside?
+
+    Two ways the left probe is fooled, both of which invent a question that is not on the
+    form and split one real question in half:
+
+    A wrapped question label is read again on its second line - page 2 prints
+    "Employment/" and then "Business Type" beneath it at the same margin - so the probe
+    sees only the tail. That split one 9-option pick-one into two, and two halves each
+    elect their own winner, which turned a double tick into two valid answers instead of
+    one over-ticked question.
+
+    An option that sits a few points lower than its siblings starts a new row, so the probe
+    sweeps left across the options already claimed and reports their printed words as a
+    question: "Other (Please specify)" became a question called "Import/Export
+    Manufacturing Agriculture Trading" - the four options next to it. If the text is just
+    those options' own words, it is not a question.
+    """
+    cur = carry.get("group", "")
+    if not cur or q == cur:
+        return bool(cur) and q == cur
+    nq = _squash(q)
+    if nq and _squash(cur).endswith(nq):
+        return True                                   # second line of the same label
+    # The probe swept across options already claimed, so the text is exactly those option
+    # words run together. Equality, not containment: page 5's list marker "c." squashes to
+    # "c", which is a substring of "detailsoffeesandcharges" - the letter inside "charges" -
+    # and a containment test merged item c. into item b. on that alone.
+    opts = carry.get("opts", [])
+    runs = {_squash("".join(opts[i:])) for i in range(len(opts))}
+    return bool(nq) and nq in (runs - {""})           # the options' own words
+
+
 def select_mode_of(raw: str) -> str:
     low = raw.lower()
     if "all that apply" in low:
@@ -402,15 +544,18 @@ def build_page(page, pno: int, carry: dict) -> list[Field]:
             if kind == "checkbox":
                 # text sitting between the frontier and this box is a NEW question
                 q, q_raw = probe_left(words, bbox, frontier)
-                if q:
+                if q and not _same_question(q, carry):
                     carry["group"] = q
                     carry["mode"] = select_mode_of(q_raw)
+                    carry["opts"] = []
                 opt, end = probe_right(words, bbox, nxt)
                 fields.append(Field(
                     id="", page=pno, kind="checkbox", label=opt, rect=bbox.as_list(),
                     section=sect, group=carry.get("group", ""),
                     select_mode=carry.get("mode", ""), row_y=round(bbox.y0, 1),
                 ))
+                # remembered so the next row can tell a real question from these options
+                carry.setdefault("opts", []).append(opt)
                 frontier = max(end, bbox.x1)
             else:
                 # A signature/stamp block is tall enough to sit beside two or three
@@ -430,6 +575,7 @@ def build_page(page, pno: int, carry: dict) -> list[Field]:
                 ))
                 frontier = bbox.x1
                 carry["group"] = ""   # a text field ends any checkbox group
+                carry["opts"] = []
 
     fields.extend(harvest_tables(page, pno, heads))
     return fields

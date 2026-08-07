@@ -3,6 +3,8 @@ FastAPI service for the Account Opening Form extractor.
 
 Endpoints
   POST   /api/extract                          upload a form, start a job
+  PATCH  /api/jobs/{id}/fields/{fid}           correct one value by hand
+  DELETE /api/jobs/{id}/fields/{fid}/edit      undo that correction
   GET    /api/jobs/{id}                        progress, then the result
   GET    /api/jobs/{id}/pages/{n}/preview.png  the aligned page, for review
   GET    /api/jobs/{id}/fields/{fid}/crop.png  the exact patch a value was read from
@@ -22,17 +24,19 @@ import urllib.error
 import urllib.request
 
 import cv2
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from jobs import BUILD, REGISTRY, ROOT, STAGES, cleanup, start
+from jobs import (BUILD, REGISTRY, ROOT, STAGES, apply_edits, cleanup,
+                  set_edit, start)
 
 DIST = os.path.join(ROOT, "frontend", "dist")
 SCHEMA = os.path.join(BUILD, "template_schema.json")
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")
+MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")            # words
+MODEL_NUM = os.environ.get("HBL_VLM_NUM", "glm-ocr:latest")  # digits
 
 MAX_UPLOAD = 64 * 1024 * 1024
 ALLOWED = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -66,25 +70,55 @@ def _png(img) -> Response:
 # -------------------------------------------------------------------- routes
 @app.get("/api/health")
 def health():
-    """Everything the UI needs to know before accepting an upload."""
-    model_ready, models = False, []
+    """Everything the UI needs to know before accepting an upload.
+
+    Two readers have to be reported, not one. Words go to a general VLM and digits to an
+    OCR model, and the two failures are not equivalent: without the VLM nothing can be read
+    at all, whereas without the OCR model the run still completes with the VLM covering the
+    numeric fields - at the cost of digit errors no format check can see. So a missing OCR
+    reader is a warning about accuracy, not a blocked upload.
+    """
+    models: list[str] = []
     try:
         with urllib.request.urlopen(f"{OLLAMA}/api/tags", timeout=4) as r:
             models = [m["name"] for m in json.loads(r.read()).get("models", [])]
-        model_ready = any(m.split(":")[0] == MODEL.split(":")[0] for m in models)
     except (urllib.error.URLError, OSError, ValueError, KeyError):
         pass
+
+    def installed(name: str) -> bool:
+        # tags carry a :tag suffix that the configured name may omit
+        return any(m.split(":")[0] == name.split(":")[0] for m in models)
+
+    text_ready, num_ready = installed(MODEL), installed(MODEL_NUM)
 
     schema_fields = 0
     if os.path.exists(SCHEMA):
         with open(SCHEMA, encoding="utf-8") as fh:
             schema_fields = len(json.load(fh).get("fields", []))
 
+    warnings = []
+    if text_ready and not num_ready:
+        warnings.append(
+            f"{MODEL_NUM} is not pulled, so dates, CNICs, phone numbers and amounts will "
+            f"be read by {MODEL} instead. It is measurably weaker on digits and its "
+            f"mistakes are well-formed, so they pass every format check."
+        )
+
     return {
-        "ok": schema_fields > 0 and model_ready,
+        # blocked only by the things that stop a run outright
+        "ok": schema_fields > 0 and text_ready,
+        "degraded": bool(warnings),
+        "warnings": warnings,
         "schema_fields": schema_fields,
         "schema_ready": schema_fields > 0,
-        "model": MODEL, "model_ready": model_ready,
+        # kept for callers written against the single-model shape
+        "model": MODEL, "model_ready": text_ready,
+        "readers": [
+            {"role": "words", "model": MODEL, "ready": text_ready, "required": True,
+             "reads": "names, addresses and free text"},
+            {"role": "digits", "model": MODEL_NUM, "ready": num_ready, "required": False,
+             "reads": "dates, CNIC, phone, IBAN, amounts"},
+        ],
         "models_available": models,
         "ollama": OLLAMA,
         "stages": [{"key": k, "label": lab, "description": d} for k, lab, d, _ in STAGES],
@@ -105,17 +139,12 @@ async def extract(file: UploadFile = File(...), pages: str | None = Form(None)):
     if not os.path.exists(SCHEMA):
         raise HTTPException(503, "Field schema missing - run src/build_schema.py first")
 
-    n = None
-    if pages not in (None, "", "all"):
-        try:
-            n = int(pages)
-        except ValueError:
-            raise HTTPException(400, "pages must be a whole number, or 'all'") from None
-        if n < 1:
-            raise HTTPException(400, "pages must be at least 1")
-
+    # `pages` is a selection, not a count: "2" reads page 2 on its own, and "1,4-6" reads
+    # exactly those. Validation happens inside start(), which knows the document length.
     try:
-        job = start(file.filename or "form.pdf", data, n)
+        job = start(file.filename or "form.pdf", data, pages)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
     except Exception as exc:                                  # noqa: BLE001
         raise HTTPException(400, f"Could not read the document: {exc}") from None
     return JSONResponse(job.public(), status_code=202)
@@ -129,7 +158,46 @@ def list_jobs():
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str):
-    return _job_or_404(job_id).public()
+    job = _job_or_404(job_id)
+    d = job.public()
+    if d.get("result"):
+        d["result"] = apply_edits(job_id, d["result"])
+    return d
+
+
+@app.patch("/api/jobs/{job_id}/fields/{field_id}")
+def edit_field(job_id: str, field_id: str, body: dict = Body(...)):
+    """Correct one value by hand.
+
+    The extraction itself is never overwritten - the correction is stored separately, keeps
+    the value it replaced, and is re-validated, so a hand-typed CNIC is checked exactly as
+    a read one would be and can still come back flagged.
+    """
+    job = _job_or_404(job_id)
+    if job.status != "done":
+        raise HTTPException(409, "Extraction has not finished")
+    if "value" not in body:
+        raise HTTPException(400, "Body must be {\"value\": ...}")
+    try:
+        merged = set_edit(job_id, field_id, body["value"])
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    rec = next((r for r in merged["fields"] if r["field"] == field_id), None)
+    return {"field": rec, "edit_count": merged.get("edit_count", 0)}
+
+
+@app.delete("/api/jobs/{job_id}/fields/{field_id}/edit")
+def revert_field(job_id: str, field_id: str):
+    """Undo a correction and put the model's own value back."""
+    job = _job_or_404(job_id)
+    if job.status != "done":
+        raise HTTPException(409, "Extraction has not finished")
+    try:
+        merged = set_edit(job_id, field_id, None, revert=True)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from None
+    rec = next((r for r in merged["fields"] if r["field"] == field_id), None)
+    return {"field": rec, "edit_count": merged.get("edit_count", 0)}
 
 
 @app.delete("/api/jobs/{job_id}")
