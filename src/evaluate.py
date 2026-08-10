@@ -56,10 +56,14 @@ def main(doc: str, page: int):
     got = {r["field"]: r for r in recs if r["kind"] != "checkbox"}
     truth = dict(gt["values"])
 
-    # A wrapped answer is read as one strip, so its whole text lands in the parent box
-    # while the continuation box is legitimately empty. Ground truth was transcribed
-    # box-by-box, so compare the joined value against the joined truth - otherwise both
-    # halves score as misses purely because of where the line break was recorded.
+    # A wrapped answer sometimes comes back whole in the parent box, leaving the
+    # continuation box empty. Ground truth was transcribed box-by-box, so in that case the
+    # joined value is compared against the joined truth - otherwise both halves would score
+    # as misses purely because of where the line break happened to be recorded.
+    #
+    # Only in that case. Reading the whole page at once, the model usually does split the
+    # two lines the way they are written, and folding the truth then would score a correct
+    # first line against the text of both lines.
     folded = []
     for r in recs:
         parent = r.get("continuation_of")
@@ -67,6 +71,8 @@ def main(doc: str, page: int):
             continue
         if str((got.get(parent) or {}).get("value") or "") == "":
             continue                      # parent empty: nothing was folded, score as-is
+        if str((got.get(r["field"]) or {}).get("value") or "") != "":
+            continue                      # both lines were read separately, as recorded
         truth[parent] = ", ".join(p.strip().rstrip(",").strip()
                                   for p in (truth[parent], truth[r["field"]]) if p.strip())
         truth.pop(r["field"])

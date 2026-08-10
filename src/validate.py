@@ -18,7 +18,13 @@ import re
 # --------------------------------------------------------------------- typing
 # Ordered: the first pattern that matches the field's label wins.
 LABEL_TYPES: list[tuple[str, str]] = [
-    (r"\biban\b", "iban"),
+    # The form has two IBAN boxes and only one says "IBAN". Page 3's direct-debit box is
+    # the other: 24 cells with "PK", "HABB" and "00" pre-printed into them, exactly like
+    # page 1's. Typing it off the "A/c No." in its label instead gave it "digits only",
+    # which rejected a correctly-read IBAN as invalid - and, because the type also decides
+    # what the model is told to expect, is the kind of mismatch that puts the prompt and
+    # the format check on different pages.
+    (r"\biban\b|direct debit a/?c|repayment a/?c", "iban"),
     (r"\bcnic\b|\bid\s*no\b|\bid\s*number\b|\bsnic\b|\bnicop\b", "cnic"),
     (r"passport", "passport"),
     (r"\bntn\b", "ntn"),

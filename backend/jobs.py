@@ -4,7 +4,7 @@ Job runner for the extraction pipeline.
 Extraction takes minutes, not milliseconds, so an HTTP request cannot wait for it.
 Uploads therefore create a job that runs on a worker thread while the browser polls for
 progress. Each job gets its own document name, so every artefact it writes
-(build/registered/<job>, build/crops/<job>, build/reads/<job>.json, ...) is naturally
+(build/registered/<job>, build/fields/<job>.json, build/reads/<job>.json, ...) is naturally
 isolated from every other job - no locking needed.
 
 Progress is real, not a timer: each stage reports through a callback, and the stage
@@ -32,25 +32,25 @@ if SRC not in sys.path:
 BUILD = os.path.join(ROOT, "build")
 UPLOADS = os.path.join(BUILD, "uploads")
 
-import crop_fields                      # noqa: E402
 import extract as extract_mod           # noqa: E402
+import fields as fieldmod               # noqa: E402
 import read_checkboxes                  # noqa: E402
-import read_text                        # noqa: E402
+import read_page                        # noqa: E402
 import register                         # noqa: E402
 from validate import assess             # noqa: E402
 
-# (key, label, description, weight). Weights are the share of wall-clock each stage
-# takes; "Reading handwriting" is by far the longest because it is the only stage that
-# runs a model.
+# (key, label, description, weight). Weights are the share of wall-clock each stage takes.
+# Reading is still the longest, but by a much smaller margin than it was when every field
+# cost its own model call: a page is now one call, so alignment is a real share of the run.
 STAGES = [
     ("align", "Aligning pages",
-     "Matching each scanned page onto the blank form", 0.14),
+     "Matching each scanned page onto the blank form", 0.26),
     ("locate", "Locating fields",
-     "Cutting one image per field from the aligned scan", 0.05),
+     "Finding every answer box and measuring the ink in it", 0.08),
     ("boxes", "Reading checkboxes",
-     "Measuring ink in every tick box", 0.05),
+     "Measuring ink in every tick box", 0.06),
     ("read", "Reading handwriting",
-     "Transcribing handwritten values with the local vision model", 0.68),
+     "Transcribing each page with the local vision model", 0.52),
     ("verify", "Validating",
      "Checking formats, repairing slips and cross-checking fields", 0.08),
 ]
@@ -175,7 +175,7 @@ def run_job(job: Job, pdf_path: str) -> None:
         )
 
         _set(job, "locate", 0.2, "Locating fields")
-        index = crop_fields.run(doc)
+        index = fieldmod.build_index(doc, pages)
         n_read = sum(1 for r in index if r["needs_model"] and r["page"] in pages)
         _set(job, "locate", 1.0, f"{len(index)} fields located, {n_read} to transcribe")
 
@@ -184,7 +184,7 @@ def run_job(job: Job, pdf_path: str) -> None:
         _set(job, "boxes", 1.0, "Checkboxes read")
 
         _set(job, "read", 0.0, f"Transcribing {n_read} handwritten fields")
-        read_text.run(
+        read_page.run(
             doc, pages=pages,
             progress=lambda d, t, m: _set(job, "read", d / max(t, 1), m),
         )
@@ -289,12 +289,11 @@ def _save_edits(job_id: str, edits: dict) -> None:
     os.replace(tmp, edits_path(job_id))
 
 
-def _crop_record(job_id: str, field_id: str) -> dict | None:
-    p = os.path.join(BUILD, "crops", job_id, "index.json")
-    if not os.path.exists(p):
+def field_record(job_id: str, field_id: str) -> dict | None:
+    """The field-index record for one field, or None if this job has no index yet."""
+    if not os.path.exists(fieldmod.index_path(job_id)):
         return None
-    with open(p, encoding="utf-8") as fh:
-        return next((r for r in json.load(fh) if r["field"] == field_id), None)
+    return next((r for r in fieldmod.load_index(job_id) if r["field"] == field_id), None)
 
 
 def apply_edits(job_id: str, data: dict) -> dict:
@@ -319,10 +318,10 @@ def apply_edits(job_id: str, data: dict) -> dict:
             r["value"] = bool(new) and str(new).lower() not in ("false", "0", "", "no")
             r["note"] = "corrected by reviewer"
         else:
-            crop = _crop_record(job_id, r["field"]) or {"label": r["label"],
-                                                        "grid_hint": "", "cells": 0,
-                                                        "kind": r["kind"]}
-            a = assess(str(new), crop)
+            rec = field_record(job_id, r["field"]) or {"label": r["label"],
+                                                       "grid_hint": "", "cells": 0,
+                                                       "kind": r["kind"]}
+            a = assess(str(new), rec)
             r.update(type=a["type"], value=a["value"], valid=a["valid"])
             r["note"] = a["note"] or "corrected by reviewer"
         r["edited"] = True
@@ -366,9 +365,9 @@ def set_edit(job_id: str, field_id: str, value, revert: bool = False) -> dict:
 def cleanup(job_id: str) -> None:
     """Drop a job's artefacts. Uploads hold customer PII, so make removal explicit
     and complete rather than leaving files behind after a review is finished."""
-    for sub in ("registered", "crops"):
-        shutil.rmtree(os.path.join(BUILD, sub, job_id), ignore_errors=True)
-    for f in (os.path.join(BUILD, "reads", f"{job_id}.json"),
+    shutil.rmtree(os.path.join(BUILD, "registered", job_id), ignore_errors=True)
+    for f in (fieldmod.index_path(job_id),
+              os.path.join(BUILD, "reads", f"{job_id}.json"),
               os.path.join(BUILD, "output", f"{job_id}.json"),
               os.path.join(BUILD, "output", f"{job_id}.csv"),
               os.path.join(BUILD, "output", f"{job_id}.edits.json")):

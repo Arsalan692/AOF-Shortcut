@@ -11,7 +11,7 @@
 # ── Generated pipeline artefacts ─────────────────────────────────────────────
 # Everything under build/ is derived and rebuilt by the pipeline:
 #   template_schema.json  <- python src/build_schema.py
-#   registered/ crops/ reads/ output/ qa/  <- per-document, regenerated per run
+#   registered/ fields/ reads/ output/ qa/  <- per-document, regenerated per run
 #
 # build/uploads/ holds forms uploaded through the web UI. On a real form that is
 # customer PII, so this must never reach a repository.
@@ -35,6 +35,7 @@ ENV/
 # frontend/.gitignore already covers node_modules, dist and logs; this catches
 # the archived bundle, which its `dist` pattern does not match.
 frontend/dist.zip
+frontend/node_modules/
 
 # ── Editors and OS clutter ───────────────────────────────────────────────────
 .vscode/

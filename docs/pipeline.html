@@ -1,0 +1,588 @@
+<title>How a page is processed — HBL form extraction</title>
+
+<style>
+  /* Light palette is the base. Every colour is defined here, so the un-stamped
+     "system" state always resolves; the dark blocks below only re-point tokens. */
+  :root {
+    --ground:   #F6F8F8;
+    --surface:  #FFFFFF;
+    --ink:      #111B1A;
+    --muted:    #566B69;
+    --faint:    #7C8D8B;
+    --rule:     #DCE5E3;
+    --rule-soft:#E9EFEE;
+    --teal:     #00786D;
+    --teal-bg:  #E4F1EF;
+    --amber:    #9A6100;
+    --amber-bg: #F8EEDC;
+    --red:      #A32B22;
+    --red-bg:   #F8E7E5;
+
+    /* The schematics are printed diagrams pasted into the page: paper ground and
+       ink strokes, identical in both themes, so a flowchart never has to be read
+       through an inverted palette. */
+    --paper:      #FCFDFD;
+    --paper-ink:  #16221F;
+    --paper-rule: #C3D2CF;
+
+    --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", "Cascadia Code", Consolas, "DejaVu Sans Mono", monospace;
+
+    --measure: 68ch;
+    --step: clamp(1.5rem, 3vw, 2.5rem);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #0D1413;
+      --surface:  #131D1C;
+      --ink:      #DEE8E6;
+      --muted:    #93A5A2;
+      --faint:    #7C8D8B;
+      --rule:     #233130;
+      --rule-soft:#1B2726;
+      --teal:     #3FBFB0;
+      --teal-bg:  #102B28;
+      --amber:    #D79A3A;
+      --amber-bg: #2C2211;
+      --red:      #E0685C;
+      --red-bg:   #2E1614;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:   #0D1413;
+    --surface:  #131D1C;
+    --ink:      #DEE8E6;
+    --muted:    #93A5A2;
+    --faint:    #7C8D8B;
+    --rule:     #233130;
+    --rule-soft:#1B2726;
+    --teal:     #3FBFB0;
+    --teal-bg:  #102B28;
+    --amber:    #D79A3A;
+    --amber-bg: #2C2211;
+    --red:      #E0685C;
+    --red-bg:   #2E1614;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: clamp(1.75rem, 5vw, 4.5rem) 1.25rem 6rem;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--step); }
+  .prose { max-width: var(--measure); }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--teal);
+    margin: 0 0 0.65rem;
+  }
+
+  h1 {
+    font-size: clamp(1.9rem, 4.4vw, 2.7rem);
+    line-height: 1.12;
+    letter-spacing: -0.021em;
+    margin: 0 0 0.75rem;
+    text-wrap: balance;
+    font-weight: 650;
+  }
+
+  h2 {
+    font-size: clamp(1.25rem, 2.6vw, 1.5rem);
+    letter-spacing: -0.012em;
+    margin: 0 0 0.4rem;
+    text-wrap: balance;
+    font-weight: 640;
+  }
+
+  h3 { font-size: 1.02rem; margin: 0 0 0.3rem; font-weight: 650; letter-spacing: -0.005em; }
+  p  { margin: 0 0 0.9rem; }
+  p:last-child { margin-bottom: 0; }
+
+  .lede { font-size: 1.1rem; color: var(--muted); }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  code, .m { font-family: var(--mono); font-size: 0.88em; }
+  code {
+    background: var(--rule-soft);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.08em 0.36em;
+    white-space: nowrap;
+  }
+
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 0; }
+
+  /* ---- schematic panels: always paper, in both themes ---- */
+  figure { margin: 0; display: flex; flex-direction: column; gap: 0.7rem; }
+  .schematic {
+    background: var(--paper);
+    border: 1px solid var(--paper-rule);
+    border-radius: 10px;
+    padding: 1.4rem 1rem;
+    overflow-x: auto;
+  }
+  .schematic pre.mermaid { margin: 0; background: transparent; text-align: center; }
+  figcaption {
+    font-size: 0.86rem;
+    color: var(--muted);
+    max-width: var(--measure);
+  }
+  figcaption b { color: var(--ink); font-weight: 600; }
+
+  /* ---- stage list: the numbering is the pipeline order, not decoration ---- */
+  .stages { display: flex; flex-direction: column; gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
+  .stage { background: var(--surface); padding: 1.15rem 1.3rem; display: grid; grid-template-columns: 2.6rem 1fr; gap: 0 1rem; }
+  .stage-n { font-family: var(--mono); font-size: 0.82rem; color: var(--teal); padding-top: 0.22rem; font-variant-numeric: tabular-nums; }
+  .stage-file { font-family: var(--mono); font-size: 0.8rem; color: var(--faint); margin: 0 0 0.5rem; }
+  .stage-body { max-width: var(--measure); }
+  .stage-body p { margin: 0 0 0.55rem; font-size: 0.96rem; }
+  .stage-body p:last-child { margin-bottom: 0; }
+
+  .gate {
+    display: block;
+    border-left: 2px solid var(--amber);
+    background: var(--amber-bg);
+    padding: 0.5rem 0.8rem;
+    margin: 0.6rem 0 0;
+    border-radius: 0 5px 5px 0;
+    font-size: 0.9rem;
+  }
+  .gate .lbl { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--amber); display: block; margin-bottom: 0.15rem; }
+
+  /* ---- gate reference table ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.62rem 0.9rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--muted); background: var(--rule-soft); border-bottom: 1px solid var(--rule); }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.thr { font-family: var(--mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.act { color: var(--muted); }
+
+  .pill { display: inline-block; font-family: var(--mono); font-size: 0.68rem; letter-spacing: 0.06em; text-transform: uppercase; padding: 0.12em 0.5em; border-radius: 999px; border: 1px solid currentColor; }
+  .pill.stop { color: var(--red); background: var(--red-bg); }
+  .pill.rev  { color: var(--amber); background: var(--amber-bg); }
+  .pill.go   { color: var(--teal); background: var(--teal-bg); }
+
+  .note { border-left: 2px solid var(--teal); background: var(--teal-bg); padding: 0.85rem 1rem; border-radius: 0 6px 6px 0; font-size: 0.94rem; max-width: var(--measure); }
+  .note p { margin: 0 0 0.5rem; }
+  .note p:last-child { margin: 0; }
+
+  a { color: var(--teal); }
+  a:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; border-radius: 3px; }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="prose">
+    <p class="eyebrow">HBL Account Opening Form &middot; extraction pipeline</p>
+    <h1>How one scanned page becomes checked data</h1>
+    <p class="lede">
+      A page enters as pixels and leaves as a list of named, format-checked values. Between
+      those two points sit <strong>nine decision gates</strong> — each one deciding whether the
+      page is usable, whether a box holds ink, whether a reading can be trusted, and whether a
+      human needs to look. This is the whole path, gates included.
+    </p>
+  </header>
+
+  <hr />
+
+  <figure>
+    <div class="schematic">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#FCFDFD','primaryColor':'#FFFFFF','primaryTextColor':'#16221F','primaryBorderColor':'#9FB3B0','lineColor':'#4E625F','secondaryColor':'#EDF3F2','tertiaryColor':'#FFFFFF','fontFamily':'ui-monospace, Consolas, monospace','fontSize':'13px'}}}%%
+flowchart TD
+    START(["Scanned page<br/>PDF or image"]) --> R1["Render blank template + scan<br/>at 150 dpi"]
+    R1 --> R2["ORB features<br/>RANSAC homography"]
+    R2 --> G1{"Expected template page<br/>verified?<br/>inliers &ge; 25"}
+
+    G1 -- no --> R3["Search all 9 template pages<br/>score = RANSAC-verified inliers"]
+    R3 --> R4
+    G1 -- yes --> R4["Warp scan into template space<br/>at 300 dpi"]
+
+    R4 --> R5["Subtract printed form<br/>&rarr; ink layer"]
+    R5 --> G2{"coverage &ge; 0.80<br/>and offset &le; 4 px?"}
+    G2 -- no --> BAD["Page marked bad<br/>every field on it &rarr; needs review"]
+    G2 -- yes --> F1
+    BAD --> F1["Nearest-box ownership partition<br/>every pixel &rarr; its closest field"]
+
+    F1 --> F2["Per field: claim ink within 8 pt,<br/>then complete the whole stroke"]
+    F2 --> CB["Checkboxes: measure ink per option<br/>most ink wins if &ge; 55% of its question"]
+    F2 --> G3{"owned ink<br/>= 0 px?"}
+
+    G3 -- yes --> GATE(["source = ink-gate<br/>value = empty<br/>never sent to a model"])
+    G3 -- no --> P1["Trim page to the fields being read<br/>scale to 1.2 Mpx"]
+
+    P1 --> P2["Draw numbered marker on every box<br/>outline + tag in the label margin"]
+    P2 --> P3["Build numbered prompt:<br/>label + format + ink note"]
+    P3 --> CALL["ONE call to qwen2.5vl:7b<br/>JSON schema requires keys 1..N"]
+
+    CALL --> G4{"Reply parses,<br/>all keys present?"}
+    G4 -- no --> UNREAD["value not produced<br/>confidence low"]
+    G4 -- yes --> SW
+
+    UNREAD --> SW["OCR sweep:<br/>re-read every structured field<br/>from its own crop with glm-ocr"]
+    SW --> G5{"OCR value valid<br/>and different?"}
+    G5 -- no --> KEEP["keep the page reading"]
+    G5 -- yes --> TAKE["take the OCR reading"]
+    TAKE --> G6{"page reading was<br/>non-empty too?"}
+    G6 -- yes --> DISP["mark disputed<br/>&rarr; needs review"]
+    G6 -- no --> RT
+    DISP --> RT
+    KEEP --> RT
+
+    RT{"Fails format check?<br/>OR ink says filled but value empty?<br/>OR ink says blank but value present?"}
+    RT -- yes --> RR["Re-read from an enlarged crop<br/>neighbours' strokes painted out"]
+    RR --> G7{"new value<br/>well formed?"}
+    G7 -- yes --> ACC["accept it"]
+    G7 -- no --> REJ["reject, keep the earlier value"]
+    ACC --> V1
+    REJ --> V1
+    RT -- no --> V1
+
+    V1["Type the field from its label<br/>CNIC / date / IBAN / mobile / name ..."]
+    V1 --> G8{"Value passes<br/>its format rule?"}
+    G8 -- no --> REP["Try a letter&rarr;digit repair"]
+    REP --> G9{"Repair turns it<br/>invalid &rarr; valid?"}
+    G9 -- yes --> FIXED["accept + record the change"]
+    G9 -- no --> FLAG["invalid &rarr; needs review"]
+    G8 -- yes --> XC
+    FIXED --> XC
+    FLAG --> XC
+
+    XC["Cross-field checks:<br/>CNIC last digit vs Gender tick,<br/>expiry after issue, title vs name"]
+    XC --> OUT(["output/&lt;doc&gt;.json + .csv<br/>value, source, model, confidence,<br/>note, needs_review"])
+    CB --> XC
+
+    classDef gate fill:#F8EEDC,stroke:#B98422,color:#4A3208;
+    classDef stop fill:#F8E7E5,stroke:#B4463C,color:#5A1A15;
+    classDef model fill:#E4F1EF,stroke:#3E9A90,color:#0C3B36;
+    classDef term fill:#EDF3F2,stroke:#7C9793,color:#16221F;
+    class G1,G2,G3,G4,G5,G6,G7,G8,G9,RT gate;
+    class BAD,UNREAD,FLAG,REJ stop;
+    class CALL,SW,RR model;
+    class START,OUT,GATE term;
+      </pre>
+    </div>
+    <figcaption>
+      <b>The full path of one page.</b> Amber diamonds are decisions, teal boxes are the three
+      places a model is called, red boxes are outcomes that end up in front of a human. Note that
+      a bad page is never discarded — it flows on with every field flagged, because silently
+      dropping a page is worse than reporting a doubtful one.
+    </figcaption>
+  </figure>
+
+  <hr />
+
+  <section class="prose">
+    <h2>Why the ink is measured before anything is read</h2>
+    <p>
+      Two of the nine gates depend on a single number: how much pen ink a box owns. It is worth
+      seeing how that number is produced, because it is what lets the pipeline tell the model
+      things instead of asking it.
+    </p>
+  </section>
+
+  <figure>
+    <div class="schematic">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#FCFDFD','primaryColor':'#FFFFFF','primaryTextColor':'#16221F','primaryBorderColor':'#9FB3B0','lineColor':'#4E625F','fontFamily':'ui-monospace, Consolas, monospace','fontSize':'13px'}}}%%
+flowchart LR
+    A["ink layer<br/>printed form removed"] --> B["nearest-box partition"]
+    B --> C{"stroke starts<br/>within 8 pt<br/>of the box?"}
+    C -- no --> D["not this field's ink"]
+    C -- yes --> E["claim the whole<br/>connected stroke"]
+    E --> F["ink_px for the field"]
+
+    F --> G{"ink_px &le; 500?"}
+    G -- yes --> H(["NO INK<br/>told to the model:<br/>answer EMPTY"])
+    G -- no --> I{"ink_px &ge; 4000<br/>AND &ge; 3 &times; the template's<br/>own printed baseline?"}
+    I -- yes --> J(["INK PRESENT<br/>told to the model:<br/>never answer EMPTY"])
+    I -- no --> K(["no claim made<br/>the model decides alone"])
+
+    classDef gate fill:#F8EEDC,stroke:#B98422,color:#4A3208;
+    classDef term fill:#EDF3F2,stroke:#7C9793,color:#16221F;
+    class C,G,I gate;
+    class H,J,K term;
+      </pre>
+    </div>
+    <figcaption>
+      <b>How a box is judged empty or filled.</b> The middle band deliberately says nothing: the
+      claim is only made where the measurement is unambiguous. The <span class="m">3 &times; baseline</span>
+      guard is what stands every date grid down — the template prints a faint
+      <span class="m">D D M M Y Y Y Y</span> inside those boxes, and an <em>empty</em> one carries
+      2,989 px against a <em>filled</em> one's 4,326.
+    </figcaption>
+  </figure>
+
+  <hr />
+
+  <section class="prose">
+    <h2>Stage by stage</h2>
+    <p>
+      Each stage below narrows what the next one has to decide. The ordering is the pipeline's,
+      not an outline — stage 4 cannot run before stage 1 has put the page into template space.
+    </p>
+  </section>
+
+  <div class="stages">
+
+    <div class="stage">
+      <div class="stage-n">01</div>
+      <div class="stage-body">
+        <h3>Put the scan into template space</h3>
+        <p class="stage-file">src/register.py</p>
+        <p>
+          The blank template is a vector PDF, so its geometry is exact. Feature points are matched
+          between template and scan and a homography warps the scan onto it, correcting rotation,
+          scale, translation and mild perspective at once. After this, template point (x,&nbsp;y) is
+          always at the same pixel of the scan.
+        </p>
+        <p>
+          Page order is verified rather than assumed: the expected page is tried first, and only if
+          it fails is the full search run. Scoring by raw descriptor matches does not work — it once
+          assigned scan page 2 to template page 6 — so candidates are scored by RANSAC-verified
+          inliers.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — page quality</span>
+          <span class="m">coverage &ge; 0.80</span> and <span class="m">offset &le; 4 px</span>.
+          A misaligned page does not give slightly wrong data, it reads ink from the wrong boxes.
+          Failing does not stop the run — every field on that page carries the page's problems into
+          the review list.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">02</div>
+      <div class="stage-body">
+        <h3>Decide which strokes belong to which field</h3>
+        <p class="stage-file">src/fields.py</p>
+        <p>
+          Handwriting on this form overflows badly — up to 34&nbsp;pt against 16&nbsp;pt row spacing,
+          with 23.5% of all ink sitting wholly outside every box. So a field's extent is measured
+          from the ink, not assumed from the rectangle: every pixel is assigned to its nearest box,
+          ink must start within 8&nbsp;pt of a box to be claimed at all, and once a stroke is claimed
+          the rest of its connected component comes with it.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — is there anything here</span>
+          <span class="m">ink_px == 0</span> &rarr; the field is settled as empty and never costs a
+          model call. 60 of this form's 247 answer boxes exit here.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">03</div>
+      <div class="stage-body">
+        <h3>Read the tick boxes without a model</h3>
+        <p class="stage-file">src/read_checkboxes.py</p>
+        <p>
+          Roughly 45% of all fields are checkboxes, and they can be read deterministically. Ink is
+          measured inside each box, then each <em>question</em> is resolved competitively: most ink
+          wins, provided it holds at least 55% of the group's total. That is what survives ticks
+          drawn far larger than the 11&nbsp;pt box, spilling across their neighbours.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — one answer or many</span>
+          Questions the form itself words as <em>"select all that apply"</em> skip the competition
+          and are scored independently.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">04</div>
+      <div class="stage-body">
+        <h3>Read the whole page in one call</h3>
+        <p class="stage-file">src/read_page.py &middot; src/prompts.py</p>
+        <p>
+          The page is trimmed to the region holding fields, scaled to a pixel budget, and every
+          answer box gets a thin outline and a numbered tag — placed in the printed-label column,
+          where covering something costs nothing. The prompt is the matching numbered list: each
+          entry names the field, states the exact Pakistani or HBL format expected, and carries the
+          ink verdict from stage 2.
+        </p>
+        <p>
+          Because of that pairing, the model is never asked which value belongs to which label —
+          the failure that whole-page OCR is known for. It is asked only to read handwriting.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — did the reply survive</span>
+          The request carries a JSON schema requiring keys <span class="m">1..N</span>, so a short
+          reply is impossible. If it still fails to parse, those fields are recorded as unread
+          rather than guessed at.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">05</div>
+      <div class="stage-body">
+        <h3>Check every number a second time</h3>
+        <p class="stage-file">src/read_page.py &middot; _sweep_structured</p>
+        <p>
+          At a page resolution cheap enough to be practical, digits suffer — and a wrong digit
+          produces a <em>valid</em> value that no rule can catch. So every CNIC, date, phone, IBAN,
+          postcode and account number is read again from its own crop by a small OCR model, which
+          has no vocabulary to guess with and simply copies characters.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — who is believed</span>
+          The OCR reading wins only if it is well formed, and never replaces a real value with a
+          blank. If both readings are valid and they differ, the OCR value is taken
+          <em>and</em> the field is flagged — nothing downstream can settle that disagreement.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">06</div>
+      <div class="stage-body">
+        <h3>Re-read what cannot be right</h3>
+        <p class="stage-file">src/read_page.py &middot; _retry_page</p>
+        <p>
+          A field is re-read from an enlarged crop, with neighbouring strokes painted out, when it
+          fails its format check, or when its value contradicts the ink measurement in either
+          direction — a box holding 7,961&nbsp;px of pen that came back empty, or a box holding
+          186&nbsp;px of a neighbour's bleed that came back with a value.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — accept the second reading?</span>
+          Only if it is well formed. A valid value is never traded for an invalid one just because
+          it arrived later.
+        </span>
+      </div>
+    </div>
+
+    <div class="stage">
+      <div class="stage-n">07</div>
+      <div class="stage-body">
+        <h3>Judge every value, and say why</h3>
+        <p class="stage-file">src/validate.py &middot; src/extract.py</p>
+        <p>
+          The field's label decides its type, and the type decides both what the model was told to
+          expect and what the value is now checked against — one source, so the two cannot drift
+          apart. The rules are the Pakistani formats as issued: a CNIC's first digit is the issuing
+          province and is never 0; Karachi and Lahore landlines carry 8-digit subscriber numbers and
+          everywhere else 7; an IBAN on this form must carry HBL's own bank code.
+        </p>
+        <p>
+          Repairs are one-directional — a letter&rarr;digit substitution is accepted only when it
+          turns an invalid value into a valid one — and every change is recorded in the record's
+          note. Nothing is silently corrected and nothing is silently dropped.
+        </p>
+        <span class="gate">
+          <span class="lbl">Gate — does a human need to see it</span>
+          A field is flagged when it fails its format, when two readers disagreed, when the ink
+          contradicts it, or when it sits on a badly registered page.
+        </span>
+      </div>
+    </div>
+
+  </div>
+
+  <hr />
+
+  <section class="prose">
+    <h2>Every gate, and what it decides</h2>
+    <p>
+      The thresholds are not tuning knobs picked by feel — each was measured against this form and
+      is documented where it lives.
+    </p>
+  </section>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th>Gate</th><th>Test</th><th>If it fails</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Page identity</td>
+          <td class="thr">inliers &ge; 25</td>
+          <td class="act">search all 9 template pages</td>
+          <td><span class="pill go">recovers</span></td>
+        </tr>
+        <tr>
+          <td>Page alignment</td>
+          <td class="thr">coverage &ge; 0.80<br/>offset &le; 4 px</td>
+          <td class="act">every field on the page flagged</td>
+          <td><span class="pill rev">review</span></td>
+        </tr>
+        <tr>
+          <td>Ink present at all</td>
+          <td class="thr">ink_px &gt; 0</td>
+          <td class="act">settled as empty, no model call</td>
+          <td><span class="pill go">skips</span></td>
+        </tr>
+        <tr>
+          <td>Box is blank</td>
+          <td class="thr">ink_px &le; 500</td>
+          <td class="act">model told to answer EMPTY</td>
+          <td><span class="pill go">informs</span></td>
+        </tr>
+        <tr>
+          <td>Box is filled</td>
+          <td class="thr">ink_px &ge; 4000<br/>&amp; &ge; 3&times; baseline</td>
+          <td class="act">model told never to answer EMPTY</td>
+          <td><span class="pill go">informs</span></td>
+        </tr>
+        <tr>
+          <td>Reply usable</td>
+          <td class="thr">JSON keys 1..N</td>
+          <td class="act">recorded as not produced</td>
+          <td><span class="pill stop">unread</span></td>
+        </tr>
+        <tr>
+          <td>OCR overrules page</td>
+          <td class="thr">valid &amp; different</td>
+          <td class="act">page reading kept</td>
+          <td><span class="pill rev">disputed</span></td>
+        </tr>
+        <tr>
+          <td>Checkbox winner</td>
+          <td class="thr">&ge; 55% of the<br/>question's ink</td>
+          <td class="act">no option marked</td>
+          <td><span class="pill rev">review</span></td>
+        </tr>
+        <tr>
+          <td>Format check</td>
+          <td class="thr">national format</td>
+          <td class="act">repair, else flag</td>
+          <td><span class="pill rev">review</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <p>
+      <b>The thread running through all of it:</b> the blank template already knows where every
+      field is and what it should contain. So the model is only ever asked to read handwriting —
+      never to work out layout, never to judge whether a box is empty, never to decide which value
+      belongs to which label.
+    </p>
+    <p>
+      Every time one of those judgements was left to the model, it got it wrong: two phone numbers
+      returned under each other's labels, a ticked option copied into the blank box beside it, a
+      passport number in plain view reported as empty.
+    </p>
+  </div>
+
+</div>

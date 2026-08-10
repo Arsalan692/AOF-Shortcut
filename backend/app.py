@@ -30,13 +30,17 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from jobs import (BUILD, REGISTRY, ROOT, STAGES, apply_edits, cleanup,
-                  set_edit, start)
+                  field_record, set_edit, start)
+
+# jobs puts src/ on sys.path as a side effect of importing, so anything from there has to
+# come after it - including this, which is why it is not up with the other imports.
+import fields as fieldmod              # noqa: E402
 
 DIST = os.path.join(ROOT, "frontend", "dist")
 SCHEMA = os.path.join(BUILD, "template_schema.json")
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")            # words
-MODEL_NUM = os.environ.get("HBL_VLM_NUM", "glm-ocr:latest")  # digits
+MODEL = os.environ.get("HBL_VLM", "qwen2.5vl:7b")            # reads whole pages
+MODEL_NUM = os.environ.get("HBL_VLM_NUM", "glm-ocr:latest")  # re-reads structured fields
 
 MAX_UPLOAD = 64 * 1024 * 1024
 ALLOWED = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -72,11 +76,12 @@ def _png(img) -> Response:
 def health():
     """Everything the UI needs to know before accepting an upload.
 
-    Two readers have to be reported, not one. Words go to a general VLM and digits to an
-    OCR model, and the two failures are not equivalent: without the VLM nothing can be read
-    at all, whereas without the OCR model the run still completes with the VLM covering the
-    numeric fields - at the cost of digit errors no format check can see. So a missing OCR
-    reader is a warning about accuracy, not a blocked upload.
+    Two readers have to be reported, not one. The VLM reads every page; the OCR model only
+    re-reads structured fields whose first value failed its format check. The two failures
+    are not equivalent: without the VLM nothing can be read at all, whereas without the OCR
+    model the run still completes with the VLM re-reading its own misses - at the cost of
+    digit errors no format check can see. So a missing OCR reader is a warning about
+    accuracy, not a blocked upload.
     """
     models: list[str] = []
     try:
@@ -99,9 +104,10 @@ def health():
     warnings = []
     if text_ready and not num_ready:
         warnings.append(
-            f"{MODEL_NUM} is not pulled, so dates, CNICs, phone numbers and amounts will "
-            f"be read by {MODEL} instead. It is measurably weaker on digits and its "
-            f"mistakes are well-formed, so they pass every format check."
+            f"{MODEL_NUM} is not pulled, so a date, CNIC, phone number or amount that "
+            f"fails its format check will be re-read by {MODEL} instead. It is measurably "
+            f"weaker on digits and its mistakes are well-formed, so they pass every "
+            f"format check."
         )
 
     return {
@@ -114,10 +120,10 @@ def health():
         # kept for callers written against the single-model shape
         "model": MODEL, "model_ready": text_ready,
         "readers": [
-            {"role": "words", "model": MODEL, "ready": text_ready, "required": True,
-             "reads": "names, addresses and free text"},
-            {"role": "digits", "model": MODEL_NUM, "ready": num_ready, "required": False,
-             "reads": "dates, CNIC, phone, IBAN, amounts"},
+            {"role": "pages", "model": MODEL, "ready": text_ready, "required": True,
+             "reads": "every field on a page, in one pass"},
+            {"role": "re-reads", "model": MODEL_NUM, "ready": num_ready, "required": False,
+             "reads": "checks every date, CNIC, phone, IBAN and amount a second time"},
         ],
         "models_available": models,
         "ollama": OLLAMA,
@@ -229,24 +235,20 @@ def page_preview(job_id: str, page: int, width: int = 1100):
 def field_crop(job_id: str, field_id: str, scale: float = 1.0):
     """The exact patch a value was read from.
 
-    This is the review feature that matters: a reviewer can see the handwriting behind
-    any value without hunting for it on the page.
+    This is the review feature that matters: a reviewer can see the handwriting behind any
+    value without hunting for it on the page. Cut from the aligned page when asked for,
+    rather than pre-generated - the extent each answer occupies is already in the field
+    index, so this costs one file read.
     """
     _job_or_404(job_id)
     if "/" in field_id or "\\" in field_id or ".." in field_id:
         raise HTTPException(400, "Bad field id")
-    idx_path = os.path.join(BUILD, "crops", job_id, "index.json")
-    if not os.path.exists(idx_path):
-        raise HTTPException(404, "No crops for this job yet")
-    with open(idx_path, encoding="utf-8") as fh:
-        rec = next((r for r in json.load(fh) if r["field"] == field_id), None)
+    rec = field_record(job_id, field_id)
     if rec is None:
         raise HTTPException(404, "Unknown field for this job")
-    img = cv2.imread(os.path.join(ROOT, rec["crop"]), cv2.IMREAD_GRAYSCALE)
+    img = fieldmod.review_crop(job_id, rec, scale)
     if img is None:
-        raise HTTPException(404, "Crop image missing")
-    if scale and scale != 1.0 and 0.2 <= scale <= 4.0:
-        img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        raise HTTPException(404, "The aligned page for this field is missing")
     return _png(img)
 
 

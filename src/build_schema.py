@@ -578,6 +578,7 @@ def build_page(page, pno: int, carry: dict) -> list[Field]:
                 carry["opts"] = []
 
     fields.extend(harvest_tables(page, pno, heads))
+    fields.extend(harvest_blank_rules(page, pno, heads))
     return fields
 
 
@@ -801,6 +802,70 @@ def link_continuations(fields: list[Field]) -> None:
         if best is not None:
             f.continuation_of = best.id
             f.label = f"{f.label} (cont.)"
+
+
+# ------------------------------------------------------- ruled-line blanks
+# Not every place a customer writes is a white rectangle. Page 4's SBP Annexure CF-1
+# undertaking is a printed sentence with the gaps drawn as runs of underscore characters:
+#
+#   "I ______________ S/O, D/O, W/O______________ holder of CNIC ______________,"
+#
+# The white-rect harvest cannot see those, so the applicant's name, their father's or
+# husband's name, their CNIC and the undertaking date were silently absent from the schema
+# and never extracted - four real customer values, one of them a CNIC, on a declaration the
+# State Bank requires. There are exactly four such runs in the whole nine-page template, all
+# on this one line, so this cannot invent fields elsewhere.
+UNDERSCORE_RUN = re.compile(r"_{4,}")
+BLANK_RISE = 13.0      # pt of space above the rule; writing sits ON the line, not under it
+BLANK_DROP = 2.0
+# The three name/CNIC blanks are 130pt of underscores; the date one is 32pt, which is what
+# a date needs and no more. The floor only has to exclude an underscore used as punctuation,
+# and the whole template contains four underscore runs, all of them real blanks.
+MIN_BLANK_W = 25.0
+
+# The label is the printed text leading into each blank, which is how every other field on
+# this form is named too. These four read as sentence fragments rather than captions, so
+# they are given the caption the fragment means. Prefixed, so that adding them can never
+# renumber an existing id: page 4 already has three fields labelled "CNIC".
+BLANK_LABELS = [
+    (r"holder\s+of\s+cnic$", "Undertaking - CNIC"),
+    (r"s/o,?\s*d/o,?\s*w/o$", "Undertaking - Father's/Husband's Name"),
+    (r"\bas\s+on$", "Undertaking - As on Date"),
+    (r"^i$", "Undertaking - Name of Applicant"),
+]
+
+
+def harvest_blank_rules(page, pno: int, heads) -> list[Field]:
+    """Fields written on a printed underscore rule rather than inside a box."""
+    out: list[Field] = []
+    # rawdict, not dict: only rawdict carries a bbox per character, and the run's extent is
+    # a property of the underscores themselves, not of the span that happens to contain the
+    # whole sentence.
+    for block in page.get_text("rawdict")["blocks"]:
+        for line in block.get("lines", []):
+            chars = [(c["bbox"][0], c["bbox"][1], c["bbox"][2], c["bbox"][3], c["c"])
+                     for s in line.get("spans", []) for c in s.get("chars", [])]
+            text = "".join(c[4] for c in chars)
+            if not UNDERSCORE_RUN.search(text):
+                continue
+            for m in UNDERSCORE_RUN.finditer(text):
+                run = chars[m.start():m.end()]
+                x0 = min(c[0] for c in run)
+                x1 = max(c[2] for c in run)
+                if x1 - x0 < MIN_BLANK_W:
+                    continue
+                y1 = max(c[3] for c in run)
+                lead = re.sub(r"[\s_]+$", "", text[:m.start()]).strip().lower()
+                lead = re.split(r"_{4,}", lead)[-1].strip()
+                label = next((v for pat, v in BLANK_LABELS if re.search(pat, lead)),
+                             clean_label(lead[-40:]) or "Undertaking")
+                out.append(Field(
+                    id="", page=pno, kind="text", label=label,
+                    rect=[round(x0, 2), round(y1 - BLANK_RISE, 2),
+                          round(x1, 2), round(y1 + BLANK_DROP, 2)],
+                    section=section_for(y1, heads), row_y=round(y1 - BLANK_RISE, 1),
+                ))
+    return out
 
 
 def slug(s: str, fallback: str) -> str:

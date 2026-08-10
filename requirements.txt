@@ -7,3 +7,6 @@ numpy>=1.26
 fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
+
+# Tests only - fastapi.testclient needs it (tests/test_api_smoke.py)
+httpx2>=0.28

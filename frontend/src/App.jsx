@@ -553,8 +553,10 @@ export default function App() {
     : [...prev, n].sort((a, b) => a - b))
   const modelDown = health && !health.model_ready
   // a missing OCR reader does not stop a run, it quietly costs accuracy on the digits -
-  // which is exactly the kind of thing that should not be silent
-  const digitReader = health?.readers?.find((r) => r.role === 'digits')
+  // which is exactly the kind of thing that should not be silent. It is the reader the API
+  // marks optional; matching on that rather than on a role name keeps this working when the
+  // roles are renamed, which is exactly how it broke last time.
+  const digitReader = health?.readers?.find((r) => r.required === false)
   const degraded = Boolean(health?.model_ready && health?.degraded)
 
   return (
@@ -643,12 +645,12 @@ export default function App() {
           {degraded && status === 'idle' && (
             <div className="banner review alert-wide">
               <span className="dot" />
-              Digit reader missing &mdash; numbers will be less reliable
+              Number checker missing &mdash; numbers will be less reliable
               <span className="note">
-                &nbsp;&middot;&nbsp;pull <code>{digitReader?.model}</code> so dates, CNICs,
-                phone numbers and amounts are read by the OCR model.
-                Without it {health.model} reads them, and its digit mistakes are
-                well-formed &mdash; they pass every format check.
+                &nbsp;&middot;&nbsp;pull <code>{digitReader?.model}</code> so every date,
+                CNIC, phone number, IBAN and amount is read a second time by the OCR model.
+                Without it those values stand on {health.model}&rsquo;s single reading, and
+                its digit mistakes are well-formed &mdash; they pass every format check.
               </span>
             </div>
           )}

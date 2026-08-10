@@ -6,7 +6,7 @@ reviewable record per field:
 
   template_schema.json  what fields exist, and what each one is
   alignment.json        whether the page it came from registered properly
-  crops/<doc>/index.json    the ink evidence and crop provenance
+  fields/<doc>.json     the ink evidence and the extent each answer occupies
   reads/<doc>.json      what the local vision model transcribed
   read_checkboxes       tick boxes, measured rather than read
 
@@ -24,7 +24,9 @@ import os
 import sys
 from collections import defaultdict
 
+import fields as fieldmod
 import read_checkboxes
+from prompts import ink_verdict
 from validate import assess, cross_check
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,25 +35,23 @@ if hasattr(sys.stdout, "reconfigure"):
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCHEMA = os.path.join(ROOT, "build", "template_schema.json")
 
-SOURCE_NAMES = {"batch": "vlm-batch", "retry": "vlm-recheck",
-                "single": "vlm-single",      # kept for caches written before batched re-reads
-                "with-parent": "read-with-parent",   # a wrapped line, read as one strip
-                "ink-gate": "ink-gate"}
+SOURCE_NAMES = {"page": "vlm-page",          # read with the rest of its page, in one call
+                "ocr-sweep": "ocr-verified",  # a structured field, second-opinioned by OCR
+                "retry": "vlm-recheck",      # re-read on its own after failing its format
+                "ink-gate": "ink-gate",      # no ink in the box, so never sent to a model
+                # caches written by the earlier per-field batch reader
+                "batch": "vlm-batch", "single": "vlm-single",
+                "with-parent": "read-with-parent"}
 
-# Below this, "there is ink here" is not evidence that this box was filled in. Because
-# handwriting overflows its box by design (see README), an empty field next to a full one
-# picks up a few hundred pixels of its neighbour's strokes. Measured on page 1: the three
-# genuinely-empty "Other (specify)" boxes carry 186, 328 and 373px, while the smallest
-# real answer on the page - a single digit, "4" in Number of Dependents - carries 827.
-# The floor sits between them with room on both sides. It only suppresses the review
-# flag; the field is still cropped and still read, so a value here is never discarded.
-INK_FLOOR_PX = 500
+# "Is this box filled in?" is answered in exactly one place - prompts.ink_verdict() - so
+# that what the model is told, what gets re-read, and what a person is asked to look at all
+# rest on the same measurement and the same thresholds. Flagging a field is never a reason
+# to discard its value: everything here is reported either way.
 
 
 def load(doc: str):
     schema = json.load(open(SCHEMA, encoding="utf-8"))
-    crops = json.load(open(os.path.join(ROOT, "build", "crops", doc, "index.json"),
-                           encoding="utf-8"))
+    crops = fieldmod.load_index(doc)
     reads_path = os.path.join(ROOT, "build", "reads", f"{doc}.json")
     reads = json.load(open(reads_path, encoding="utf-8")) if os.path.exists(reads_path) else {}
     align_path = os.path.join(ROOT, "build", "registered", doc, "alignment.json")
@@ -96,6 +96,14 @@ def build(doc: str) -> dict:
                 conf, note = "low", note or "no value produced"
             elif not a["valid"]:
                 conf = "low"
+            elif (r or {}).get("disputed"):
+                # Two readers read this box and got different, individually valid values -
+                # the OCR reader's was taken. No rule can settle it (that is what "both
+                # valid" means), so it goes to a human. These are the errors that otherwise
+                # ship silently: a misread digit in a CNIC still yields a valid CNIC.
+                conf = "low"
+                note = note or (f"readers disagreed - page read {(r or {}).get('was')!r}, "
+                                f"the OCR reader read {raw!r} and was taken")
             elif src == "ink-gate":
                 conf = "high"                  # zero ink: empty is a measurement
             elif src == "read-with-parent":
@@ -108,11 +116,17 @@ def build(doc: str) -> dict:
                 # the pixels say barely-anything, the model says there is a value
                 conf = "low"
                 note = note or "faint ink but a value was read - check for spill-over"
-            elif (c["ink_hint"] != "empty" and c["ink_px"] >= INK_FLOOR_PX
-                    and a["empty"] and not a.get("explicit_none")):
-                # ink was measured but nothing was transcribed - either a missed value
-                # or spill-over from a neighbour. An explicit "N/A" is not this case,
-                # and neither is a trace too small to be an answer (INK_FLOOR_PX).
+            elif (ink_verdict(c) == "filled" and a["empty"]
+                    and not a.get("explicit_none")):
+                # Ink was measured but nothing was transcribed - either a missed value or
+                # spill-over from a neighbour. An explicit "N/A" is not this case.
+                #
+                # The test is the same conclusive one the prompt and the re-read use, and it
+                # has to be: a weaker floor made this the noisiest flag on the form. Page 3's
+                # blank supplementary-card grids carry 500-2200px of residue where the
+                # printed cell borders survive registration, so a bare "any ink over 500px"
+                # rule reported 30 empty boxes as unread answers - on a form with 118 filled
+                # fields, that is a review list a person stops reading.
                 conf = "low"
                 note = note or "ink present but read as empty"
 
