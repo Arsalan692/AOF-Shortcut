@@ -379,7 +379,15 @@ def run(doc: str, pages=None, retry: bool = True, force: bool = False,
     """Read every requested page of `doc`. progress: callable(done, total, message)."""
     index = fieldmod.load_index(doc)
     cache_path = os.path.join(ROOT, "build", "reads", f"{doc}.json")
-    cache = {} if force else load_cache(cache_path)
+    cache = load_cache(cache_path)
+    if force:
+        # --force means "ignore what you cached for the pages I am asking you to read", and
+        # nothing more. Emptying the whole cache instead destroys the pages this run is not
+        # touching: `--pages 4 --force` silently erased pages 1, 2, 3 and 9 and cost an hour
+        # of re-reading, because the cache is then saved back over the file.
+        page_of = {r["field"]: r["page"] for r in index}
+        cache = {fid: v for fid, v in cache.items()
+                 if pages is not None and page_of.get(fid) not in pages}
 
     # A field with no ink at all is settled without spending a call on it, and is left out
     # of the page image so the model is never shown a box it could invent a value into.
