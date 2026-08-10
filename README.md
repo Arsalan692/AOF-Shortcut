@@ -87,13 +87,31 @@ with *"0399 is not a Pakistani mobile prefix"*. A reviewer can make a typo too.
 
 ## Run the web app
 
-One-time setup:
+One-time setup on a fresh machine:
 
 ```bash
+python -m venv venv                   # Python 3.11+ (developed on 3.13)
+venv\Scripts\activate                 # Windows;  source venv/bin/activate elsewhere
 pip install -r requirements.txt
-python src/build_schema.py            # derives the 431-field schema from the blank template
+
+ollama pull qwen2.5vl:7b              # reads the pages   (~6 GB)
+ollama pull glm-ocr                   # checks the numbers (~2 GB)
+
+python src/build_schema.py            # derives the 435-field schema from the blank template
 cd frontend && npm install && npm run build && cd ..
 ```
+
+`build/` is gitignored and absent on a fresh clone, so `build_schema.py` is not optional —
+nothing downstream runs without `build/template_schema.json`. Likewise `frontend/dist` is
+built, not committed: skip `npm run build` and `/` serves JSON instead of the app.
+
+Check it before uploading anything: `GET /api/health` should report `schema_ready` with 435
+fields and both readers `ready`.
+
+**Hardware is the thing that decides whether this is usable.** Measured on a 4-core 15 W
+laptop CPU with no usable GPU, one page costs ~14 minutes, of which 76% is prefill. The same
+code and models on a machine with a CUDA GPU do a page in well under a minute. A GPU
+workstation is still local, so nothing about the privacy constraint changes.
 
 Then, from the **`backend/` directory**:
 

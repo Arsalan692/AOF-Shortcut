@@ -1,12 +1,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Source documents ARE tracked on purpose:
-#   Forms/Account_Opening_Form_blank template.pdf  - the field schema is derived
-#     from this file, so the pipeline cannot be rebuilt without it
-#   Forms/Cif-form.pdf                             - dummy-data sample form
-# Never add a blanket *.pdf rule here; it would silently exclude both.
+# Forms/ - allow-listed, not blanket-tracked.
+#
+# Exactly three documents belong in this repository:
+#   Account_Opening_Form_blank template.pdf  the field schema is derived from this
+#                                            file, so the pipeline cannot be rebuilt
+#                                            without it - it is not a sample, it is
+#                                            a source
+#   Cif-form.pdf, cif-2.pdf                  dummy-data samples, scored against the
+#                                            ground truth in tests/
+#
+# Everything else dropped into Forms/ is ignored, because the next PDF to land here
+# is a real customer's account opening form - name, CNIC, address, income. Ignoring
+# by default means committing customer PII takes a deliberate `git add -f` instead
+# of an absent-minded `git add -A`.
+#
+# Two ways to get this wrong:
+#   - a blanket *.pdf rule would exclude the blank template, and the project cannot
+#     be rebuilt from a clone without it
+#   - tracking all of Forms/ (what this used to do) makes leaking a customer form
+#     the default behaviour of `git add -A`
 # ─────────────────────────────────────────────────────────────────────────────
-!Forms/
-!Forms/**
+Forms/*
+!Forms/Account_Opening_Form_blank template.pdf
+!Forms/Cif-form.pdf
+!Forms/cif-2.pdf
 
 # ── Generated pipeline artefacts ─────────────────────────────────────────────
 # Everything under build/ is derived and rebuilt by the pipeline:
